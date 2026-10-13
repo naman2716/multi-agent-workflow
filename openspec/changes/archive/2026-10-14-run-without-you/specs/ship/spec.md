@@ -9,3 +9,7 @@ base branch.
 ### Requirement: Degrade quietly
 Without a remote, `gh`, or authentication, shipping SHALL be skipped with a note and the run SHALL
 still succeed.
+
+### Requirement: CI results belong to the pushed commit
+A CI verdict SHALL be taken only once the PR shows the pushed commit and its checks are no longer
+pending; cancelled checks SHALL NOT count as passed or produce a fix card.

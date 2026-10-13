@@ -95,6 +95,48 @@ class Planning:
 
 
 @dataclass
+class Autonomy:
+    """Self-healing: a triage agent looks at a card before it is blocked."""
+    triage: bool = True
+    # actions applied automatically; any other choice goes to you as a note
+    triage_actions: list[str] = field(default_factory=lambda: ["rewrite", "escalate", "split"])
+
+
+@dataclass
+class Ship:
+    """End of run: push the integration branch, open/update a draft PR, fix red CI.
+    Off unless the project's orchestra.toml turns it on (`orchestra init` does)."""
+    auto: bool = False
+    remote: str = "origin"
+    draft: bool = True
+    gh: str = "gh"                   # GitHub CLI (must be logged in: gh auth login)
+    ci_wait_minutes: float = 30      # how long to wait for checks after each push
+    ci_fix_rounds: int = 2           # red CI becomes a fix card at most this many times per run
+    linear_magic_word: str = "Part of"  # "Part of ENG-123" links the PR without closing the ticket
+
+
+@dataclass
+class NtfySettings:
+    """Push notifications and answers from your phone via ntfy (https://ntfy.sh)."""
+    server: str = "https://ntfy.sh"
+    # Both topic names are secrets on public ntfy.sh. `orchestra ntfy setup` keeps them in
+    # .orchestra/ntfy.json (not committed); set them here only if orchestra.toml isn't committed.
+    topic: str = ""                  # you subscribe to this one in the ntfy app
+    reply_topic: str = ""            # answers are posted here
+    token_env: str = "NTFY_TOKEN"    # optional access token for a protected server
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.topic)
+
+
+@dataclass
+class LinearSettings:
+    api_key_env: str = "LINEAR_API_KEY"
+    comment: bool = False            # comment on the ticket when cards are queued and the PR opens
+
+
+@dataclass
 class Limits:
     wait_for_reset: bool = True       # pause and resume automatically when a usage limit hits
     stop_new_at: float = 0.9          # stop starting new agents above this utilization (0-1)
@@ -145,6 +187,10 @@ class Config:
     ask_in_terminal: bool = True     # ask decisions live in the terminal during `run`
     decision_wait_minutes: float = 60  # without a terminal, keep running this long for answers
     notify_cmd: str = ""  # shell command run with $ORCHESTRA_TITLE / $ORCHESTRA_MESSAGE
+    autonomy: Autonomy = field(default_factory=Autonomy)
+    ship: Ship = field(default_factory=Ship)
+    ntfy: NtfySettings = field(default_factory=NtfySettings)
+    linear: LinearSettings = field(default_factory=LinearSettings)
 
     @property
     def state_path(self) -> Path:
@@ -172,6 +218,9 @@ class Config:
         rv = data.get("review", {})
         ev = data.get("env", {})
         pl = data.get("planning", {})
+
+        def section(cls_, key):
+            return cls_(**{k: v for k, v in data.get(key, {}).items() if k in cls_.__dataclass_fields__})
         profile = m.get("profile", DEFAULT_PROFILE)
         if profile not in MODEL_PROFILES:
             raise ValueError(f"unknown model profile {profile!r}; use one of {list(MODEL_PROFILES)}")
@@ -215,7 +264,26 @@ class Config:
             notify_cmd=data.get("notify", {}).get("command", ""),
             ask_in_terminal=o.get("ask_in_terminal", True),
             decision_wait_minutes=o.get("decision_wait_minutes", 60),
+            autonomy=section(Autonomy, "autonomy"),
+            ship=section(Ship, "ship"),
+            ntfy=_with_saved_topics(section(NtfySettings, "ntfy"),
+                                    repo / o.get("state_dir", ".orchestra") / NTFY_TOPICS_FILE),
+            linear=section(LinearSettings, "linear"),
         )
+
+
+NTFY_TOPICS_FILE = "ntfy.json"
+
+
+def _with_saved_topics(s: NtfySettings, path: Path) -> NtfySettings:
+    """Fill empty topic names from the file `orchestra ntfy setup` writes (gitignored)."""
+    try:
+        saved = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return s
+    s.topic = s.topic or str(saved.get("topic") or "")
+    s.reply_topic = s.reply_topic or str(saved.get("reply_topic") or "")
+    return s
 
 
 def detect_gates(repo: Path) -> tuple[str, list[Gate]]:
@@ -290,10 +358,39 @@ max_wait_hours = 12
 
 [notify]
 # Shell command run for decisions, limit pauses, and run results, with
-# $ORCHESTRA_TITLE and $ORCHESTRA_MESSAGE set. Examples:
-#   macOS:  osascript -e "display notification \"$ORCHESTRA_MESSAGE\" with title \"$ORCHESTRA_TITLE\""
-#   phone:  curl -s -d "$ORCHESTRA_MESSAGE" ntfy.sh/your-private-topic
+# $ORCHESTRA_TITLE and $ORCHESTRA_MESSAGE set. Example (macOS):
+#   osascript -e "display notification \"$ORCHESTRA_MESSAGE\" with title \"$ORCHESTRA_TITLE\""
+# For your phone (with answer buttons), use [ntfy] below instead.
 command = ""
+
+[ntfy]
+# Questions arrive on your phone with answer buttons; blocked cards, PRs and run results too.
+# Run `orchestra ntfy setup`: it makes two random topic names and keeps them in
+# .orchestra/ntfy.json (not committed). Anyone who knows a topic name can read or post to it
+# on public ntfy.sh, so don't put them in this file if it is committed.
+server = "https://ntfy.sh"
+token_env = "NTFY_TOKEN"   # optional access token (protected or self-hosted server)
+
+[autonomy]
+# Before a card is blocked, a triage agent may rewrite it, retry it on a stronger model, or
+# split it into smaller cards inside its original files_scope. Once per card; you're notified.
+triage = true
+triage_actions = ["rewrite", "escalate", "split"]
+
+[ship]
+# After a run that merged work: push the integration branch, open or update one draft PR into the base
+# branch (GitHub CLI: gh auth login), wait for CI, and turn red checks into a fix card.
+auto = true
+remote = "origin"
+draft = true
+ci_wait_minutes = 30
+ci_fix_rounds = 2
+linear_magic_word = "Part of"   # links Linear tickets without closing them on merge
+
+[linear]
+# Only for `orchestra plan --linear ENG-123`: nothing is ever started from Linear on its own.
+api_key_env = "LINEAR_API_KEY"  # personal API key, read from this environment variable
+comment = false                 # comment on the ticket when cards are queued and the PR opens
 
 [quality]
 max_diff_lines = 600       # reject oversized diffs (comprehension debt)

@@ -78,3 +78,42 @@
 - Tests: each triage action incl. scope/escalation fallbacks and once-only; ship creates then edits
   the PR, red CI → fix card dispatched → green; no remote/gh → skipped; ntfy question formatting
   (≤ 3 actions) and reply parsing → resume; `plan --linear` goal and source; Linear comment calls.
+
+## As built (differences from the plan above, mostly from the independent review)
+- **Shipping is opt-in per project.** `[ship].auto` defaults to false when a config has no
+  `[ship]` section, so upgrading never starts pushing to a repo; `orchestra init` writes
+  `auto = true`. A missing remote is a log line only; a missing `gh`, failed push or gh error is
+  logged and notified.
+- **CI verdicts are for the pushed commit.** Shipping waits until the PR's `headRefOid` is the
+  pushed SHA, and a result counts only when two polls in a row show the same non-pending set.
+  `cancel` buckets give "cancelled" (no fix card); an all-skipped set gives "none".
+- **gh targets the right repo and PR**: `--repo owner/name` from the remote URL when it is on
+  github.com; fork PRs (`isCrossRepository`) are ignored. The base is the fetched
+  `<remote>/<base>` when available, so cards already on the remote base aren't listed again.
+- **The CI fix card depends on nothing** (open cards at that point wait on you or are stuck), and
+  after every ship the run works any card that became ready meanwhile (the fix card, or a card
+  answered from the phone during the CI wait), then ships again. Those later drains only wait
+  for answers to questions asked during them.
+- **ntfy topics are secrets kept out of `orchestra.toml`**: `orchestra ntfy setup` writes them to
+  `.orchestra/ntfy.json` (mode 600, gitignored); `[ntfy].topic`/`reply_topic` still work for
+  uncommitted configs. Titles carry the project name. Answer buttons (and reply help) appear only
+  when a separate reply topic is set; with `NTFY_TOKEN`, buttons send it too.
+- **Buttons are bound to their question**: each carries `T03#<tag>` where the tag hashes the repo,
+  card and `asked_at`; a stale button is refused with the current question. Typed replies
+  (`T03 2`) answer the current question.
+- A question is marked pushed only after delivery, so an undelivered one is re-sent next run.
+- **Triage and usage limits**: when a limit stops triage (paused, or the triage call itself is
+  limited), the card is blocked without using its triage and is triaged at the start of the next
+  run (`meta triage_later`).
+- Triage rewrite can set `regenerate_tests` to rewrite a wrong locked test without changing the
+  criteria. `orchestra retry` refuses a card cancelled by a split without `--force`.
+- `_integrate` records a failure under the merge lock and calls `_fail_attempt` after releasing
+  it, since triage may run a whole agent.
+- PR text from agents is defused (`Fixes ENG-7` → `Fixes → ENG-7`) so only the
+  `linear_magic_word` lines link tickets; the title comes from the latest plan with cards in the PR.
+- `orchestra plan` recomputes card ids right before queueing (a live run may have added cards);
+  `orchestra ship` refuses while a run is active unless `--force`.
+- Linear timeouts and malformed replies become `LinearError`; a failed PR comment never breaks
+  the end of a run.
+- Not done: squash-merged PRs leave their commits on the integration branch (README explains the
+  reset); a reply typed without a tag answers that card's current question.

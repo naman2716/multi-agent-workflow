@@ -11,6 +11,8 @@ Task lifecycle:
                  +--> waiting (agent asked the human a question; resumes after `answer`)
                  +--> pending + resume_note (paused by a usage limit; resumes its session)
                  +--> blocked (attempts exhausted / agent says stuck; needs a human)
+  Before blocking, a triage agent may rewrite the card (-> pending), move it to a stronger
+  model (-> pending), or split it (-> cancelled "split into ...", new cards pending). Once.
 """
 from __future__ import annotations
 
@@ -67,6 +69,8 @@ MIGRATIONS = [  # columns added after v0.1; applied idempotently
     ("decisions", "TEXT NOT NULL DEFAULT '[]'"),  # JSON: every answered question, kept on the card
     ("test_first", "INTEGER NOT NULL DEFAULT 0"),  # acceptance tests written first by another agent
     ("locked_tests", "TEXT NOT NULL DEFAULT '[]'"),  # JSON: those test files, locked for the worker
+    ("triaged", "INTEGER NOT NULL DEFAULT 0"),  # a triage agent already looked at it (once per card)
+    ("source", "TEXT"),          # where the card came from: "linear:ENG-123", "ci", ...
 ]
 
 JSON_FIELDS = ("acceptance", "non_goals", "files_scope", "depends_on", "feedback", "decisions",
@@ -124,6 +128,8 @@ class Task:
     decisions: list[dict] = field(default_factory=list)  # answered questions: question, answer, at
     test_first: bool = False
     locked_tests: list[str] = field(default_factory=list)
+    triaged: bool = False
+    source: str | None = None
     status: str = "pending"
     attempts: int = 0
     feedback: list[str] = field(default_factory=list)
@@ -145,6 +151,7 @@ class Task:
             d[f] = json.loads(d[f] or "[]")
         d["decision"] = json.loads(d["decision"]) if d.get("decision") else None
         d["test_first"] = bool(d.get("test_first"))
+        d["triaged"] = bool(d.get("triaged"))
         return cls(**d)
 
 
@@ -171,12 +178,13 @@ class Store:
             seq = self.conn.execute("SELECT COALESCE(MAX(seq),0)+1 FROM tasks").fetchone()[0]
             self.conn.execute(
                 """INSERT INTO tasks (id,title,spec,acceptance,non_goals,files_scope,depends_on,
-                   complexity,model,status,attempts,feedback,created_at,updated_at,seq,test_first)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,0,'[]',?,?,?,?)""",
+                   complexity,model,status,attempts,feedback,created_at,updated_at,seq,test_first,
+                   triaged,source)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,0,'[]',?,?,?,?,?,?)""",
                 (task.id, task.title, task.spec, json.dumps(task.acceptance),
                  json.dumps(task.non_goals), json.dumps(task.files_scope),
                  json.dumps(task.depends_on), task.complexity, task.model, task.status,
-                 now, now, seq, 1 if task.test_first else 0),
+                 now, now, seq, 1 if task.test_first else 0, 1 if task.triaged else 0, task.source),
             )
         self.log(task.id, "created", task.title)
 

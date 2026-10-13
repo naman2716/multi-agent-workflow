@@ -19,11 +19,15 @@ goal ─► Planner (Opus, read-only, at the integration head) ─► Critic ─
    squash to one commit → Reviewer (other model family, can run tests, never edits)
         blocking findings → validators confirm or refute each
         fixable reject → worker revises in the same session → review again
-        wrong approach → fresh attempt (≤ max_attempts) → else BLOCKED for a human
+        wrong approach → fresh attempt (≤ max_attempts)
+        attempts used up / worker blocked → triage: rewrite · stronger model · split · or you
    [merge lock] rebase on integration → re-gate if base moved → CAS fast-forward
         conflict → worker resolves markers in its session → gates → review → merge
               ▼
-   orchestra/integration (one commit per card) ──► you review, open PR into main
+   orchestra/integration (one commit per card)
+        ──► push + one draft PR into main ──► CI red → fix card → push again (≤ 2 rounds)
+        ──► you review and merge
+   questions, blocked cards, PR links → your phone (ntfy); answer there with a tap
 ```
 
 ## Why it's built this way
@@ -42,7 +46,10 @@ goal ─► Planner (Opus, read-only, at the integration head) ─► Critic ─
 | Dangerous actions | OS sandbox for worker shell commands (writes only in the worktree, network only to package registries and GitHub), plus PreToolUse guards: no git state changes, no secrets written or read, no `rm -rf ..` |
 | Reviewer approves its own red flags | An approval with unmet criteria, blocker/major issues or scope creep counts as a rejection |
 | Crashes mid-run | State in SQLite; interrupted cards resume their own session (or resume at review); one live run per repo |
-| `main` getting hit | Work lands on `orchestra/integration`; your checkout is never touched |
+| `main` getting hit | Work lands on `orchestra/integration`; your checkout is never touched; PRs are drafts, never force-pushed |
+| Blocked cards wait for you | A triage agent first tries a clearer card, a stronger model, or a split (once per card) |
+| Finished work sits on a branch | A run that merged work opens/updates a draft PR and turns red CI into a fix card |
+| Questions need you at the terminal | ntfy pushes them to your phone with answer buttons |
 
 ## Setup
 
@@ -96,6 +103,8 @@ orchestra init                      # writes orchestra.toml, detects npm/flutter
 
 orchestra plan "Add shift cancellation with a 2-hour penalty window: API endpoint, \
 pricing rule, push notification to the partner, and tests"
+# or from a Linear ticket (you always start plans yourself):
+orchestra plan --linear ENG-123 "skip the admin screen for now"
 # review the printed task graph; edit .orchestra/plan.json if needed
 orchestra approve                   # (or answer y at the prompt / pass --approve)
 
@@ -104,7 +113,8 @@ orchestra status                    # queue + spend
 orchestra status T03                # history, feedback, why it was blocked
 orchestra retry T03 --note "Use the existing FCM helper in src/notify"
 orchestra test-first T04            # locked acceptance tests before the worker (or --off)
-git log main..orchestra/integration # then open a PR
+orchestra ship                      # push + draft PR + CI by hand (runs do it with [ship].auto)
+orchestra ntfy setup                # once per project: questions and results on your phone
 ```
 
 ### Interactive side: the Claude Code harness
@@ -196,8 +206,9 @@ in Claude Code), it keeps going for up to `decision_wait_minutes` (default 60) a
 everything else is done. Answer from Claude Code (`/dispatch` relays questions as they
 appear; `/decide` lists them) or from any terminal (`orchestra decisions`,
 `orchestra answer T01 --pick 3`), and the agent resumes within seconds, no restart.
-Asking never counts as a failed attempt. `[notify] command` can also ping your desktop or
-phone. Use `orchestra run --no-ask` to keep the terminal quiet.
+Asking never counts as a failed attempt. `[notify] command` can also ping your desktop, and
+with ntfy (below) you can answer from your phone. Use `orchestra run --no-ask` to keep the
+terminal quiet.
 
 ## Usage limits: pause and auto-resume
 
@@ -244,6 +255,81 @@ don't count toward the scope and diff-size gates. Later attempts reuse them. If 
 before implementation, the run log and the reviewer get a warning. The reviewer is also asked to
 check that the change doesn't stop them from running (skip markers, conftest or test-config
 edits); Orchestra doesn't check that itself.
+
+## Self-healing: triage before a card is blocked
+
+When a card uses up its attempts, or its worker (or test writer) reports it can't proceed, a
+read-only triage agent (planner model) reads the card, every note on it, its events and the
+last work report and review, looks at the code at the integration head, and picks one action:
+
+- **rewrite**: clearer spec or criteria, or a corrected `files_scope`. The card runs again from
+  attempt 1; with a new scope it first waits for open cards touching the same files. On a
+  test-first card, new criteria (or `regenerate_tests`) mean the locked tests are written again.
+- **escalate**: run it again on a stronger model (usually Opus). If it already ran on that
+  model family, it goes to you instead.
+- **split**: 2–4 smaller cards, each inside the original `files_scope` (anything outside goes to
+  you). Cards that waited on the original wait on all of them; the original ends `cancelled`
+  with "split into T08, T09" (`retry` refuses it without `--force`).
+- **human**: it stays blocked, with the triage note on the card and in the notification.
+
+Each card is triaged at most once, never past the run budget, and you're notified of what it
+did (`orchestra status T03` shows it). `[autonomy].triage_actions` limits what is applied
+automatically (others become a note for you); `triage = false` turns it off. If a usage limit
+stops a triage, it runs at the start of the next run.
+
+## Shipping: draft PR and CI fix cards
+
+With `[ship].auto = true` (set by `orchestra init`; add a `[ship]` section to older configs), a
+run that merged at least one card ends by:
+
+1. pushing `orchestra/integration` to `[ship].remote` (plain push: a rejected push is reported,
+   never forced; `main` is never pushed);
+2. opening one draft PR into the base branch with `gh`, or updating the open one: title from the
+   plan's goal, one section per card (summary, decisions, test-first note, attempts, cost) and
+   `Part of ENG-123` lines for Linear cards (links them without closing them on merge);
+3. waiting up to `ci_wait_minutes` for the checks of the pushed commit;
+4. if CI is red: queuing a **Fix CI** card (failing checks and the tail of each failing GitHub
+   Actions log in its spec; scope = the files the PR changes plus test files), working it, and
+   shipping again, at most `ci_fix_rounds` times (default 2). Cards you answer while CI runs are
+   worked and shipped too.
+
+You get the PR link (and CI result) in the run output, `orchestra status` and a notification.
+Needs the GitHub CLI logged in (`gh auth login`) on the machine that runs Orchestra; without a
+remote or `gh` it says so and the run still succeeds. `orchestra ship` does the same by hand
+(`--no-wait` to skip CI).
+
+## Answer from your phone (ntfy)
+
+```bash
+orchestra ntfy setup     # two random topic names, kept in .orchestra/ntfy.json (not committed)
+orchestra ntfy test      # a sample question; tap a button to check the round trip
+```
+
+Install the ntfy app (iOS/Android, or ntfy.sh/app) and subscribe to the printed topic. Each
+question then arrives with buttons for the recommended option and one other, plus **Other
+answer…**, which opens the reply topic where you type `T03 2`, `T03 r` or `T03: your words`.
+The run reads replies every 10 s while a card waits, and the card resumes exactly as if you had
+answered in the terminal (you get a ✓ back). Blocked cards, triage actions, PR links, pauses
+and run results arrive there too, titled with the project name.
+
+On public ntfy.sh the topic names are the only secret, which is why they are random and stay
+out of `orchestra.toml`. A reply can only answer a card that is waiting, and a button only
+answers the question it came with. For a protected or self-hosted server set `[ntfy].server`
+and an access token in `NTFY_TOKEN`.
+
+## Linear tickets (you start them)
+
+Nothing in Orchestra picks up work by itself. When you want to plan from a ticket:
+
+```bash
+export LINEAR_API_KEY=lin_api_...        # Linear → Settings → Security & access → API keys
+orchestra linear show ENG-123            # the ticket as plan input (title, description, comments)
+orchestra plan --linear ENG-123 "notes"  # plan from it; your notes take priority
+```
+
+The cards remember the ticket (`source`), and the PR links back to it. With
+`[linear].comment = true`, Orchestra comments on the ticket when its cards are queued and when
+the PR opens. In Claude Code, `/groom ENG-123` reads the ticket the same way.
 
 ## Per-card environment and faster setup
 
@@ -342,10 +428,13 @@ orchestra/
   graph.py         Graphify: graph worktree, refresh, snapshots, coupling + impact analysis
   harness.py       Claude Code harness generator (agents, skills, hooks, MCP, CLAUDE.md)
   limits.py        usage-limit tracker (pause/resume) and notifications
+  ship.py          push, draft PR upsert and CI checks/logs through gh
+  ntfy.py          phone notifications, answer buttons, reply parsing
+  linear.py        Linear GraphQL client (read a ticket, comment)
   cli.py           init / plan / approve / add / run / status / retry / cancel /
-                   graph / stats / harness / hook
-tests/             77 tests with scripted fake agents (no API calls); graph tests run
-                   real graphify and skip without it
+                   ship / ntfy / linear / graph / stats / harness / hook
+tests/             101 tests with scripted fake agents, a fake gh and fake ntfy/Linear
+                   (no API calls); graph tests run real graphify and skip without it
 openspec/          specs per module and proposed/archived changes
 ```
 
@@ -362,3 +451,9 @@ Run the tests: `python -m unittest discover -s tests -t . -v`
   edit it (or point it at `uv tool run --from 'graphifyy[mcp]' python`).
 - The reviewer catches a lot, but business logic still deserves your read before merging
   to `main`.
+- After you **squash-merge** the PR, `orchestra/integration` still holds the original commits,
+  so the next PR would show them again. Once no cards are open, reset it with
+  `git fetch origin && git branch -f orchestra/integration origin/main`, and delete the merged
+  branch on GitHub if it wasn't deleted automatically (`git push origin --delete
+  orchestra/integration`), so the next push starts it fresh. Merge commits don't need this.
+- CI fix cards get log tails only from GitHub Actions; other checks get their link.

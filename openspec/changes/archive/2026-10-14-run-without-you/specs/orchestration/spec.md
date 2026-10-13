@@ -20,3 +20,7 @@ up to `ci_fix_rounds` times.
 ### Requirement: Decisions can be answered from a phone
 With ntfy configured, every question SHALL be pushed with answer buttons, and a reply on the reply
 topic SHALL resume the waiting card exactly like a terminal answer.
+
+### Requirement: A usage limit postpones triage instead of using it up
+When a usage limit stops a card's triage, the card SHALL be blocked without being marked
+triaged, and its triage SHALL run at the start of the next run.

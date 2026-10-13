@@ -2,6 +2,8 @@
 
   orchestra init                      write orchestra.toml (auto-detects test/lint commands)
   orchestra plan "<goal>"             planner proposes a task graph -> .orchestra/plan.json
+  orchestra plan --linear ENG-123 ["notes"]   the same, from a Linear ticket
+  orchestra linear show ENG-123       print a ticket as plan input
   orchestra approve [plan.json]       load the (optionally hand-edited) plan into the queue
   orchestra add task.json             add hand-written task cards
   orchestra run                       execute the queue with parallel workers
@@ -15,6 +17,11 @@
   orchestra graph build|status|query|affected|explain|benchmark
   orchestra stats                     avg cost/tokens per task, with vs without the graph
   orchestra harness install           add the Claude Code harness (agents, skills, hooks)
+  orchestra ship [--no-wait]          push the integration branch, open/update the draft PR, show CI
+  orchestra ntfy setup [--new]        random private topics for phone notifications and answers
+  orchestra ntfy test                 send a sample question to your phone
+
+Nothing starts on its own: every plan begins with `orchestra plan` (a prompt or a Linear ticket).
 """
 from __future__ import annotations
 
@@ -23,6 +30,7 @@ import asyncio
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from .agents import ClaudeRunner
@@ -69,10 +77,40 @@ def _already_queued(store: Store, plan: dict, force: bool) -> bool:
     return True
 
 
-def _queue(store: Store, tasks: list[Task], plan: dict) -> None:
+def _card_source(source: dict | None) -> str | None:
+    if source and source.get("linear"):
+        return f"linear:{source['linear']}"
+    return None
+
+
+def _queue(store: Store, tasks: list[Task], plan: dict, goal: str = "", source: dict | None = None) -> None:
+    card_source = _card_source(source)
     for t in tasks:
+        if card_source and not t.source:
+            t.source = card_source
         store.add_task(t)
     store.set_meta("approved_plans", store.get_meta("approved_plans", []) + [plan_fingerprint(plan)])
+    plans = store.get_meta("plans", []) or []
+    store.set_meta("plans", (plans + [{"goal": goal, "source": source, "cards": [t.id for t in tasks],
+                                       "at": time.time()}])[-20:])
+
+
+def _comment_queued(cfg: Config, source: dict | None, tasks: list[Task]) -> None:
+    """With [linear].comment: tell the ticket which cards were queued for it."""
+    if not (source and source.get("linear") and cfg.linear.comment):
+        return
+    from .linear import Linear, LinearError
+    body = (f"Orchestra queued {len(tasks)} card{'s' if len(tasks) != 1 else ''} for this ticket:\n"
+            + "\n".join(f"- {t.id}: {t.title}" for t in tasks))
+    try:
+        client = Linear.from_settings(cfg.linear)
+        client.comment(client.issue(source["linear"])["id"], body)
+        print(f"Commented on {source['linear']}.")
+    except LinearError as e:
+        print(f"Linear comment skipped: {e}")
+
+
+GRAPH_OFF = "off — pip install 'graphifyy[mcp]' to enable"
 
 
 def cmd_init(args) -> None:
@@ -92,7 +130,7 @@ def cmd_init(args) -> None:
         gi.write_text("\n".join(lines + [".orchestra/"]) + "\n")
     print(f"Wrote {path}\n  base branch: {base}\n  setup: {setup or '(none)'}\n"
           f"  gates: {', '.join(g.name for g in gates) or '(none detected — add some!)'}\n"
-          f"  code graph: {'enabled (graphify found)' if has_graph else 'off — pip install \'graphifyy[mcp]\' to enable'}\n"
+          f"  code graph: {'enabled (graphify found)' if has_graph else GRAPH_OFF}\n"
           "Edit [project].context with your stack and conventions before planning.")
 
 
@@ -137,13 +175,29 @@ def plan_with_critic(cfg: Config, store: Store, goal: str, runner, verbose: bool
     return plan, issues, cost, state["cwd"], state["graph"]
 
 
+def _linear_goal(cfg: Config, ident: str, notes: str = "") -> tuple[str, dict]:
+    """The plan goal and plan source for a Linear ticket (exits with a clear message on error)."""
+    from .linear import Linear, LinearError, ticket_goal
+    try:
+        issue = Linear.from_settings(cfg.linear).issue(ident)
+    except LinearError as e:
+        sys.exit(f"Linear: {e}")
+    return ticket_goal(issue, notes), {"linear": issue["identifier"], "url": issue.get("url", "")}
+
+
 def cmd_plan(args) -> None:
     cfg = Config.load(_repo(args))
     store = _store(cfg)
-    plan, issues, cost, cwd, graph_data = plan_with_critic(cfg, store, args.goal,
+    goal, source = args.goal or "", None
+    if args.linear:
+        goal, source = _linear_goal(cfg, args.linear, args.goal or "")
+        print(goal.splitlines()[0])
+    elif not goal.strip():
+        sys.exit('Give a goal (orchestra plan "...") or a ticket (orchestra plan --linear ENG-123).')
+    plan, issues, cost, cwd, graph_data = plan_with_critic(cfg, store, goal,
                                                            ClaudeRunner(verbose=args.verbose))
     plan_path = cfg.state_path / "plan.json"
-    save_plan(plan_path, args.goal, plan)
+    save_plan(plan_path, goal, plan, source=source)
     try:
         tasks, warnings = build_tasks(plan, start=len(store.all()) + 1, graph=graph_data,
                                       existing=store.open_tasks(), root=cwd)
@@ -155,8 +209,12 @@ def cmd_plan(args) -> None:
                                         for i in issues))
     print(f"\nPlanning cost ${cost:.2f}. Plan saved to {plan_path}")
     if args.approve or (sys.stdin.isatty() and input("\nQueue these tasks? [y/N] ").lower() == "y"):
-        _queue(store, tasks, plan)
+        # ids again: a live run may have added cards (splits, CI fixes) while you read the plan
+        tasks, _ = build_tasks(plan, start=len(store.all()) + 1, graph=graph_data,
+                               existing=store.open_tasks(), root=cwd)
+        _queue(store, tasks, plan, goal, source)
         print(f"Queued {len(tasks)} tasks. Run `orchestra run`.")
+        _comment_queued(cfg, source, tasks)
     else:
         print("Not queued. Edit the plan if needed, then `orchestra approve`.")
 
@@ -171,8 +229,10 @@ def cmd_approve(args) -> None:
     tasks, warnings = build_tasks(plan, start=len(store.all()) + 1, graph=_graph_data(cfg),
                                   existing=store.open_tasks())
     print(render_plan(tasks, warnings, plan))
-    _queue(store, tasks, plan)
+    source = plan.get("source") if isinstance(plan.get("source"), dict) else None
+    _queue(store, tasks, plan, plan.get("goal", ""), source)
     print(f"\nQueued {len(tasks)} tasks.")
+    _comment_queued(cfg, source, tasks)
 
 
 def cmd_add(args) -> None:
@@ -204,7 +264,9 @@ def cmd_run(args) -> None:
               "at a time.", file=sys.stderr)
         sys.exit(3)
     # running/review cards with no live run were interrupted; the run will recover them
-    if not any(t.status in ("pending", "running", "review") for t in store.all()):
+    phone = bool(cfg.ntfy.enabled and cfg.ntfy.reply_topic and cfg.ntfy.reply_topic != cfg.ntfy.topic)
+    if not any(t.status in ("pending", "running", "review") for t in store.all()) \
+            and not (phone and store.waiting()):
         waiting = store.waiting()
         sys.exit(f"Nothing pending; {len(waiting)} card(s) wait for your decision (orchestra decisions)."
                  if waiting else "Nothing pending. Use `orchestra plan` or `orchestra add` first.")
@@ -224,8 +286,11 @@ def cmd_run(args) -> None:
         print(f"{e}.\nWatch it with `orchestra status`; only one run works the queue at a time.",
               file=sys.stderr)
         sys.exit(3)
-    print(f"\nReview the result: git log {cfg.base_branch}..{cfg.integration_branch} "
-          f"then open a PR from {cfg.integration_branch}.")
+    if orch.pr:
+        print(f"\nDraft PR: {orch.pr['url']} (CI {orch.pr['ci']})")
+    else:
+        print(f"\nReview the result: git log {cfg.base_branch}..{cfg.integration_branch}, "
+              f"then `orchestra ship` (or open a PR from {cfg.integration_branch}).")
     sys.exit(0 if counts["blocked"] == 0 else 2)
 
 
@@ -238,6 +303,8 @@ def cmd_status(args) -> None:
         print(f"{t.id} [{t.status}] {t.title}  attempts={t.attempts}  cost=${t.cost_usd:.2f}  "
               f"worker model={pick_worker_model(cfg, t)}")
         print(f"depends on: {', '.join(t.depends_on) or '-'}   scope: {', '.join(t.files_scope) or '-'}")
+        if t.source or t.triaged:
+            print(f"source: {t.source or '-'}   triaged: {'yes' if t.triaged else 'no'}")
         if t.summary:
             print(f"\nsummary: {t.summary}")
         for i, f in enumerate(t.feedback, 1):
@@ -255,6 +322,8 @@ def cmd_status(args) -> None:
     last = store.get_meta("last_run") or {}
     live = store.live_lease()
     print(f"\n{store.counts()}")
+    if pr := store.get_meta("last_pr"):
+        print(f"draft PR: {pr.get('url')} (CI {pr.get('ci')})")
     print(f"spend: lifetime ${store.total_cost():.2f} · last run ${last.get('spent_usd', 0):.2f} "
           f"· per-run cap ${cfg.total_budget_usd:.2f}"
           + (f" · run in progress (pid {live.get('pid')} on {live.get('host')})" if live else ""))
@@ -266,6 +335,9 @@ def cmd_retry(args) -> None:
     t = store.get(args.task)
     if t.status in ("merged", "running", "review") and not args.force:
         sys.exit(f"{t.id} is {t.status}; retry is for blocked, cancelled or pending cards "
+                 "(use --force to re-queue it anyway).")
+    if t.status == "cancelled" and (t.summary or "").startswith("split into") and not args.force:
+        sys.exit(f"{t.id} was {t.summary}; retrying it would redo their work "
                  "(use --force to re-queue it anyway).")
     if args.note:
         store.add_feedback(args.task, f"Guidance from the human lead: {args.note}")
@@ -434,6 +506,87 @@ def cmd_harness(args) -> None:
         print(line)
 
 
+def cmd_linear(args) -> None:
+    cfg = Config.load(_repo(args))
+    goal, _ = _linear_goal(cfg, args.ticket, args.notes or "")
+    print(goal)
+
+
+def cmd_ship(args) -> None:
+    from .ship import Shipper
+    cfg = Config.load(_repo(args))
+    store = _store(cfg)
+    if store.live_lease() and not args.force:
+        sys.exit("A run is active; it ships by itself when the queue drains (--force to ship now anyway).")
+    wait = None if args.no_wait else cfg.ship.ci_wait_minutes * 60
+    print(f"Pushing {cfg.integration_branch} and updating the draft PR…")
+    res = asyncio.run(Shipper(cfg, store, log=print).ship(wait_s=wait))
+    if res.status != "shipped":
+        sys.exit(f"Not shipped: {res.note}")
+    print(f"Draft PR {'opened' if res.created else 'updated'}: {res.pr_url}\nCI: {res.ci}"
+          + (f" ({res.note})" if res.note else ""))
+    for c in res.failed:
+        print(f"\n✗ {c.get('name')}  {c.get('link', '')}\n{c.get('log', '')[-1200:]}")
+    sys.exit(1 if res.ci == "failed" else 0)
+
+
+def cmd_ntfy(args) -> None:
+    from .ntfy import Ntfy, parse_reply, random_topic
+    from .asking import parse_answer
+    repo = _repo(args)
+    cfg = Config.load(repo)
+    s = cfg.ntfy
+    if args.action == "setup":
+        from .config import NTFY_TOPICS_FILE
+        path = cfg.state_path / NTFY_TOPICS_FILE
+        keep = s.topic and s.reply_topic and s.reply_topic != s.topic and not args.new
+        topic, reply = (s.topic, s.reply_topic) if keep else (random_topic(), random_topic())
+        if not keep:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"topic": topic, "reply_topic": reply}, indent=2) + "\n")
+            path.chmod(0o600)
+        print(("Your ntfy topics" if keep else f"New ntfy topics, saved in {path}") + ":\n"
+              f"  topic       = {topic}    ← subscribe to this in the ntfy app\n"
+              f"  reply_topic = {reply}    ← your answers go here (no need to subscribe)\n"
+              "Keep them private: on public ntfy.sh anyone who knows a name can read or post to it.\n")
+        print(f"1. Install the ntfy app (iOS / Android) or open {s.server}/app\n"
+              f"2. Subscribe to {s.server}/{topic}\n"
+              "3. Send a test question: orchestra ntfy test")
+        rc = subprocess.run(["git", "check-ignore", "-q", str(path)], cwd=repo).returncode
+        if rc != 0:
+            print(f"\nWARNING: {path} is not gitignored; add `{cfg.state_dir}/` to .gitignore.")
+        return
+    n = Ntfy.from_settings(s, label=repo.name)
+    if not n:
+        sys.exit("ntfy isn't set up: run `orchestra ntfy setup`.")
+    d = {"question": "Does this reach your phone?", "options": ["Yes, buttons work", "It arrived, no buttons"],
+         "recommendation": "Yes, buttons work", "why_it_matters": "Orchestra asks its questions like this."}
+    title, message, actions = n.question("T00", "ntfy test", d)
+    started = int(time.time())
+    asyncio.run(n.publish(title, message, actions=actions, priority=4, tags=["question"]))
+    print(f"Sent to {s.server}/{s.topic}.")
+    if not n.can_receive:
+        print("No reply_topic set (or it equals topic), so answers from the phone are off.")
+        return
+    if args.no_wait:
+        return
+    print("Tap a button or reply 'T00 1' — waiting up to 2 minutes (Ctrl-C to stop)…")
+    deadline, seen = time.time() + 120, set()
+    while time.time() < deadline:
+        for m in asyncio.run(n.poll(started - 1)):
+            if m.get("id") in seen:
+                continue
+            seen.add(m.get("id"))
+            parsed = parse_reply(m.get("message", ""))
+            if parsed and parsed[0] == "T00":
+                kind, val = parse_answer(parsed[2], d)
+                print(f"Got your reply: {m.get('message')!r} → {kind}: {val}")
+                asyncio.run(n.publish("Orchestra", f"✓ Test reply received: {val}"))
+                return
+        time.sleep(3)
+    print("No reply yet. Check the topic names, or that the phone can reach the server.")
+
+
 def cmd_hook(args) -> None:
     from .guards import hook_main
     sys.exit(hook_main(args.profile))
@@ -445,7 +598,9 @@ def main(argv: list[str] | None = None) -> None:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("init"); s.add_argument("--force", action="store_true"); s.set_defaults(fn=cmd_init)
-    s = sub.add_parser("plan"); s.add_argument("goal"); s.add_argument("--approve", action="store_true")
+    s = sub.add_parser("plan"); s.add_argument("goal", nargs="?", help="what to build (or notes with --linear)")
+    s.add_argument("--linear", metavar="TICKET", help="plan from a Linear ticket, e.g. ENG-123")
+    s.add_argument("--approve", action="store_true")
     s.add_argument("-v", "--verbose", action="store_true"); s.set_defaults(fn=cmd_plan)
     s = sub.add_parser("approve"); s.add_argument("plan", nargs="?")
     s.add_argument("--force", action="store_true", help="queue even if this plan was queued before")
@@ -489,6 +644,18 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("harness", help="install the Claude Code harness into this repo")
     s.add_argument("action", choices=["install"]); s.add_argument("--no-graph", action="store_true")
     s.add_argument("--no-git-hooks", action="store_true"); s.set_defaults(fn=cmd_harness)
+    s = sub.add_parser("linear", help="read a Linear ticket as plan input")
+    s.add_argument("action", choices=["show"]); s.add_argument("ticket")
+    s.add_argument("notes", nargs="?"); s.set_defaults(fn=cmd_linear)
+    s = sub.add_parser("ship", help="push the integration branch, open/update the draft PR, show CI")
+    s.add_argument("--no-wait", action="store_true", help="don't wait for CI")
+    s.add_argument("--force", action="store_true", help="ship even while a run is active")
+    s.set_defaults(fn=cmd_ship)
+    s = sub.add_parser("ntfy", help="phone notifications and answers via ntfy")
+    s.add_argument("action", choices=["setup", "test"])
+    s.add_argument("--new", action="store_true", help="setup: generate new topics even if set")
+    s.add_argument("--no-wait", action="store_true", help="test: don't wait for a reply")
+    s.set_defaults(fn=cmd_ntfy)
     s = sub.add_parser("hook", help="(used by Claude Code hooks) guard a tool call from stdin")
     s.add_argument("profile", choices=["interactive", "worker"]); s.set_defaults(fn=cmd_hook)
 

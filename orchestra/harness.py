@@ -113,6 +113,9 @@ def build_files(cfg: Config, graph: bool) -> dict[str, str]:
 This is thinking mode: the value is the conversation. Shape the work with the user before
 any agent writes code. Tight cards are the most important quality gate in the system.
 
+0. If the user names a Linear ticket (e.g. ENG-123), read it with `orchestra linear show ENG-123`
+   and treat it as the goal (the user's own words take priority). Only read tickets the user
+   names; never go looking for work on your own.
 1. Restate the goal and ask about anything ambiguous: business rules, edge cases, what is
    explicitly out of scope. Ask before guessing.
 2. Explore the code read-only to ground the plan.
@@ -128,6 +131,8 @@ any agent writes code. Tight cards are the most important quality gate in the sy
 4. Show the cards as a short table (id, title, scope, depends on) and iterate with the user.
 5. When the user approves, write the plan to `.orchestra/plan.json` in this shape:
 {_plan_format()}
+   Add `"goal": "<one-line goal>"` at the top (it becomes the PR title). For a Linear ticket
+   also add `"source": {{"linear": "ENG-123"}}`, so the cards and the PR link back to it.
 6. Run `orchestra approve`. It validates the graph, adds dependency edges where scopes overlap
    {"or code is coupled " if graph else ""}and queues the cards. Show its output.
 7. Suggest `/dispatch` to run them.
@@ -152,13 +157,19 @@ any agent writes code. Tight cards are the most important quality gate in the sy
    the recommended one; the user can also type their own answer). Record it exactly with
    `orchestra answer <ID> "<decision>"` (or `--pick N`). The running process notices within
    seconds and the agent resumes its own session; no restart needed.
-   Never answer on the user's behalf.
+   Never answer on the user's behalf. If ntfy is set up, the user may answer from their phone
+   instead; the card resumes the same way.
 5. If a usage limit is hit, the run pauses itself and resumes after the reset; just tell
    the user when it expects to resume.
 6. When it ends, report: merged cards, blocked cards with the reason from
-   `orchestra status <ID>`, anything still waiting on a decision, and total spend. For each
-   blocked card propose a fix: re-groom it, split it, or `orchestra retry <ID> --note "..."`.
-7. Suggest `/review-integration` to review what landed.
+   `orchestra status <ID>`, anything still waiting on a decision, and total spend. Blocked
+   cards were already triaged once (rewritten, moved to a stronger model or split when that
+   could help); show the triage note and propose a fix: re-groom it, or
+   `orchestra retry <ID> --note "..."`.
+7. Report the draft PR link and its CI result from the run's output (or `orchestra status`).
+   Red CI became a fix card automatically (up to `[ship].ci_fix_rounds` times); say whether
+   it went green.
+8. Suggest `/review-integration` to review what landed.
 
 Tip for the user: running `orchestra run` in their own terminal instead shows questions
 right there as they come up, with numbered options to answer inline.
@@ -220,8 +231,8 @@ they can't do: architecture fit, business logic, and how the cards combine.
    - business logic: pricing, payouts, booking rules, cancellations;
    - comprehension: anything you or the user can't follow is too big or too novel.
 5. Give a verdict: ship, fix first (list fixes; offer to write cards via `/groom`), or drop cards.
-6. If shipping and the user agrees, push `{integ}` and open a PR into `{base}`
-   (e.g. `gh pr create --base {base} --head {integ}`). Never push to `{base}` directly.
+6. If shipping and the user agrees, run `orchestra ship`: it pushes `{integ}`, opens or
+   updates the draft PR into `{base}`, and shows CI. Never push to `{base}` directly.
 """)
     return files
 

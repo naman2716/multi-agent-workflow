@@ -39,3 +39,7 @@ current change.
 ### Requirement: Plans get a critic pass
 With `[planning].critic` on, every plan SHALL be reviewed by a critic agent whose corrected plan
 replaces the draft when it is valid.
+
+### Requirement: Triage role
+A read-only triage agent SHALL return one action (rewrite, escalate, split, human) with its reason
+and the fields that action needs.
