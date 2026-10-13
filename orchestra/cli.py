@@ -7,6 +7,7 @@
   orchestra run                       execute the queue with parallel workers
   orchestra status [TASK]             queue, costs, and a task's history/feedback
   orchestra retry TASK [--note ...]   send a blocked task back to the queue with guidance
+  orchestra test-first TASK [--off]   locked acceptance tests written before the worker starts
   orchestra cancel TASK
   orchestra decisions                 questions agents are waiting on you for
   orchestra answer TASK "..."         answer one (or --pick N / --recommended); it resumes next run
@@ -95,36 +96,66 @@ def cmd_init(args) -> None:
           "Edit [project].context with your stack and conventions before planning.")
 
 
-def cmd_plan(args) -> None:
-    cfg = Config.load(_repo(args))
-    store = _store(cfg)
-    graph_data, res = None, None
+def plan_with_critic(cfg: Config, store: Store, goal: str, runner, verbose: bool = False):
+    """Draft a plan against the integration head (not your checkout), then let a critic
+    correct it. Returns (plan, critic_issues, cost, cwd, graph_data) or exits on failure."""
+    from .gitops import Git
+    state: dict = {}
 
     async def _plan():
-        nonlocal graph_data
         await cfg_integration(cfg)
         g = _graph(cfg)
         snap = await g.snapshot("planner") if cfg.graph.enabled else None
-        cwd = g.wt if snap else None
-        graph_data = GraphData.load(snap) if snap else None
-        print("Planning (read-only exploration" + (", using the code graph" if snap else "") + ")…")
-        return await ClaudeRunner(verbose=args.verbose).plan(cfg, args.goal, cwd=cwd, graph=snap)
+        cwd = g.wt if snap else await Git(cfg.repo, cfg.worktree_root, cfg.base_branch,
+                                          cfg.integration_branch).detached_worktree("_plan", cfg.integration_branch)
+        state.update(cwd=cwd, graph=GraphData.load(snap) if snap else None)
+        print(f"Planning against {cfg.integration_branch} (read-only"
+              + (", using the code graph" if snap else "") + ")…")
+        res = await runner.plan(cfg, goal, cwd=cwd, graph=snap)
+        critic = None
+        if res.ok and cfg.planning.critic:
+            print("Critic reviewing the plan…")
+            critic = await runner.critique_plan(cfg, goal, res.data, cwd=cwd, graph=snap)
+        return res, critic
 
-    res = asyncio.run(_plan())
-    store.set_meta("planner_cost", store.get_meta("planner_cost", 0.0) + res.cost_usd)
+    res, critic = asyncio.run(_plan())
+    cost = res.cost_usd + (critic.cost_usd if critic else 0.0)
+    store.set_meta("planner_cost", store.get_meta("planner_cost", 0.0) + cost)
     if not res.ok:
         sys.exit(f"Planner failed: {res.error}")
+    plan, issues = res.data, []
+    if critic is not None and not critic.ok:
+        print(f"Critic failed ({critic.error[:200]}); keeping the planner's draft.")
+    elif critic is not None:
+        issues = critic.data.get("issues", [])
+        if critic.data.get("verdict") == "revise":
+            try:
+                build_tasks(critic.data["plan"], start=len(store.all()) + 1)
+                plan = critic.data["plan"]
+            except (PlanError, KeyError, TypeError) as e:
+                print(f"Critic's corrected plan was invalid ({e}); keeping the planner's draft.")
+    return plan, issues, cost, state["cwd"], state["graph"]
+
+
+def cmd_plan(args) -> None:
+    cfg = Config.load(_repo(args))
+    store = _store(cfg)
+    plan, issues, cost, cwd, graph_data = plan_with_critic(cfg, store, args.goal,
+                                                           ClaudeRunner(verbose=args.verbose))
     plan_path = cfg.state_path / "plan.json"
-    save_plan(plan_path, args.goal, res.data)
+    save_plan(plan_path, args.goal, plan)
     try:
-        tasks, warnings = build_tasks(res.data, start=len(store.all()) + 1, graph=graph_data,
-                                      existing=store.open_tasks())
+        tasks, warnings = build_tasks(plan, start=len(store.all()) + 1, graph=graph_data,
+                                      existing=store.open_tasks(), root=cwd)
     except PlanError as e:
         sys.exit(f"Plan invalid: {e}\nEdit {plan_path} and run `orchestra approve`.")
-    print(render_plan(tasks, warnings, res.data))
-    print(f"\nPlanner cost ${res.cost_usd:.2f}. Plan saved to {plan_path}")
+    print(render_plan(tasks, warnings, plan))
+    if issues:
+        print("\nCritic:\n" + "\n".join(f"  - {i.get('task_key', '?')}: {i.get('problem', '')} → {i.get('fix', '')}"
+                                        for i in issues))
+    print(f"\nPlanning cost ${cost:.2f}. Plan saved to {plan_path}")
     if args.approve or (sys.stdin.isatty() and input("\nQueue these tasks? [y/N] ").lower() == "y"):
-        _queue(store, tasks, res.data)
+        _queue(store, tasks, plan)
         print(f"Queued {len(tasks)} tasks. Run `orchestra run`.")
     else:
         print("Not queued. Edit the plan if needed, then `orchestra approve`.")
@@ -270,6 +301,20 @@ def cmd_cancel(args) -> None:
     print(f"{args.task} cancelled.")
 
 
+def cmd_test_first(args) -> None:
+    cfg = Config.load(_repo(args))
+    store = _store(cfg)
+    t = store.get(args.task)
+    if t.status not in ("pending", "blocked", "cancelled") and not args.force:
+        sys.exit(f"{t.id} is {t.status}; change test-first only before an attempt starts (or --force).")
+    if args.off:
+        store.update(t.id, test_first=False, locked_tests=[])
+        print(f"{t.id}: test-first off (acceptance tests will be the worker's own).")
+    else:
+        store.update(t.id, test_first=True)
+        print(f"{t.id}: test-first on (a test writer writes locked acceptance tests before the worker).")
+
+
 def _print_decision(t) -> None:
     d = t.decision or {}
     print(f"\n{t.id}  {t.title}")
@@ -326,9 +371,15 @@ def cmd_models(args) -> None:
     cfg = Config.load(_repo(args))
     print(f"profile: {cfg.model_profile}")
     for role, m in [("planner", cfg.planner_model), ("reviewer", cfg.reviewer_model),
-                    ("small worker", cfg.small_worker_model), ("large worker", cfg.large_worker_model)]:
+                    ("small worker", cfg.small_worker_model), ("large worker", cfg.large_worker_model),
+                    ("validator", cfg.validator_model), ("test writer", cfg.test_writer_model)]:
         print(f"  {role:13} {m}")
     print(f"  escalate failed small cards to large worker: {cfg.escalate_on_retry}")
+    if cfg.review.reviewer_rule == "opposite":
+        from .agents import pick_reviewer_model
+        print(f"  reviewer rule: opposite family (small-worker cards reviewed by "
+              f"{pick_reviewer_model(cfg, cfg.small_worker_model)}, large-worker cards by "
+              f"{pick_reviewer_model(cfg, cfg.large_worker_model)})")
     over = [(t.id, t.model) for t in _store(cfg).all() if t.model and t.status not in ("merged", "cancelled")]
     for tid, m in over:
         print(f"  card override: {tid} -> {m}")
@@ -414,6 +465,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--model", help="run this card on a specific model, e.g. opus")
     s.add_argument("--force", action="store_true", help="re-queue even a merged or running card")
     s.set_defaults(fn=cmd_retry)
+    s = sub.add_parser("test-first", help="have locked acceptance tests written before the worker starts")
+    s.add_argument("task"); s.add_argument("--off", action="store_true", help="turn it off")
+    s.add_argument("--force", action="store_true"); s.set_defaults(fn=cmd_test_first)
     s = sub.add_parser("model", help="set the worker model for a queued card")
     s.add_argument("task"); s.add_argument("model", help="alias or full id; 'default' to clear")
     s.set_defaults(fn=cmd_model)

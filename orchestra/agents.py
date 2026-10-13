@@ -18,7 +18,7 @@ from typing import Any, Callable, Protocol
 from .config import Config
 from .graph import GRAPH_GUIDE, mcp_tool_names
 from .limits import LimitSignal, looks_like_limit
-from .guards import make_read_guard, make_worker_guard
+from .guards import make_read_guard, make_reviewer_guard, make_worker_guard
 from .store import Task
 
 # ---------------------------------------------------------------- schemas
@@ -42,6 +42,8 @@ PLAN_SCHEMA = {
                     "complexity": {"type": "string", "enum": ["small", "large"]},
                     "model": {"type": "string", "description":
                               "optional worker model override; omit unless the card clearly needs it"},
+                    "test_first": {"type": "boolean", "description":
+                                   "true if the card changes money, stored data, or auth/permissions"},
                 },
                 "required": ["key", "title", "spec", "acceptance_criteria", "non_goals",
                              "files_scope", "depends_on", "complexity"],
@@ -91,8 +93,50 @@ REVIEW_SCHEMA = {
                            "file": {"type": "string"}, "issue": {"type": "string"}},
             "required": ["severity", "file", "issue"]}},
         "feedback": {"type": "string", "description": "concrete instructions for the next attempt"},
+        "fixable": {"type": "boolean", "description":
+                    "true if the problems can be fixed by editing this change; false if the approach "
+                    "is wrong and starting over is better (true when approving)"},
     },
-    "required": ["verdict", "criteria", "scope_creep", "issues", "feedback"],
+    "required": ["verdict", "criteria", "scope_creep", "issues", "feedback", "fixable"],
+}
+
+VALIDATE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "confirmed": {"type": "boolean", "description":
+                      "false only if you showed the finding is wrong; true if it holds or you can't tell"},
+        "evidence": {"type": "string", "description": "what you read or ran, and what it showed"},
+    },
+    "required": ["confirmed", "evidence"],
+}
+
+TESTS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": ["done", "blocked"]},
+        "test_files": {"type": "array", "items": {"type": "string"}},
+        "covered": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"criterion": {"type": "string"}, "test": {"type": "string"}},
+            "required": ["criterion", "test"]}},
+        "assumptions": {"type": "array", "items": {"type": "string"}},
+        "blocker": {"type": "string"},
+    },
+    "required": ["status", "test_files", "covered", "assumptions", "blocker"],
+}
+
+CRITIC_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": ["ok", "revise"]},
+        "issues": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"task_key": {"type": "string"}, "problem": {"type": "string"},
+                           "fix": {"type": "string"}},
+            "required": ["task_key", "problem", "fix"]}},
+        "plan": PLAN_SCHEMA,
+    },
+    "required": ["verdict", "issues", "plan"],
 }
 
 
@@ -111,7 +155,22 @@ Rules for good tasks:
 - non_goals explicitly name tempting adjacent work the worker must NOT do.
 - complexity "large" only for multi-file work needing broad codebase reading.
 - Explore the repo first (read-only) so paths and conventions are real, not guessed.
+- Set test_first true on cards that change money (pricing, fees, payouts, refunds), stored data
+  (migrations, deletes, backfills) or auth/permissions: their acceptance tests are written by a
+  separate agent before implementation, so make those criteria precise and testable.
 - If the goal is ambiguous, still produce the best plan and list open_questions."""
+
+CRITIC_SYSTEM = """You are the plan critic in a multi-agent coding system. A planner drafted the
+task graph below; workers will implement each card in parallel with no shared conversation.
+Check it against the goal and the actual repository (read-only):
+- every part of the goal is covered, nothing beyond it is added;
+- files_scope paths are real (or clearly new files in existing folders) and specific;
+- cards that would touch the same files or call into each other are ordered with depends_on;
+- each card is one reviewable diff (under ~300 changed lines); split ones that aren't;
+- acceptance criteria are concrete and testable; non_goals name tempting extras;
+- test_first is set on cards changing money, stored data or auth/permissions.
+Return verdict "ok" with the plan unchanged if it is sound; otherwise "revise", list each
+problem with its fix, and return the full corrected plan (same keys where cards are unchanged)."""
 
 WORKER_APPEND = """
 You are a worker agent in a multi-agent orchestrator. You own exactly ONE task card.
@@ -151,7 +210,68 @@ refactors or files beyond the card); it introduces bugs, security issues, or bre
 patterns of the codebase; business logic is wrong.
 Approve only when it is correct, scoped, tested, and fits the architecture. Minor style nits
 alone are not a reason to reject. Read surrounding code to check fit. Give feedback the next
-worker can act on directly."""
+worker can act on directly.
+When you can, check behaviour instead of guessing: run the relevant tests or a short script
+(read-only; never edit files, never run git commands that change state). Report only real
+problems, each with where it is; every blocking finding will be independently verified.
+Set fixable to false only when the approach itself is wrong and starting over is better."""
+
+VALIDATOR_SYSTEM = """You verify one finding from a code review before it can block a change.
+Read the code and, when useful, run tests or a short script (read-only; never edit files or
+run state-changing git commands). Return confirmed=false only if you can show the finding is
+wrong (the criterion is met, the bug can't happen, the change is within the card's scope),
+with the evidence. If it holds, or you can't tell, return confirmed=true."""
+
+TEST_WRITER_APPEND = """
+You write the acceptance tests for ONE task card BEFORE anyone implements it.
+- Write tests only: new or updated test files that follow the repository's test conventions.
+  Do not change application code, fixtures outside test folders, or configuration.
+- One or more tests per acceptance criterion; they must fail now (the behaviour doesn't exist
+  yet) and pass once the card is implemented correctly. Test behaviour through public
+  interfaces, not implementation details.
+- Run them to confirm they fail for the right reason (missing behaviour, not syntax errors).
+- If a criterion is ambiguous, test the clearest reading and list it under assumptions; do not
+  ask questions. Report "blocked" only if the card can't be tested at all.
+- These files will be locked: the implementer can't edit them.
+Your final answer must be the structured report."""
+
+
+def model_family(model: str) -> str:
+    m = (model or "").lower()
+    return next((f for f in ("opus", "sonnet", "haiku") if f in m), m)
+
+
+def pick_reviewer_model(cfg: Config, worker_model: str) -> str:
+    """With reviewer_rule = "opposite", never review a change with its author's model family."""
+    reviewer = cfg.reviewer_model
+    if cfg.review.reviewer_rule != "opposite" or model_family(reviewer) != model_family(worker_model):
+        return reviewer
+    return "sonnet" if model_family(worker_model) == "opus" else "opus"
+
+
+def blocking_findings(v: dict) -> list[dict]:
+    """The findings that make a review a rejection, in a form a validator can check."""
+    out = [{"kind": "criterion", "text": c.get("criterion", ""), "detail": c.get("evidence", ""), "ref": c}
+           for c in v.get("criteria", []) if not c.get("met")]
+    out += [{"kind": "issue", "text": i.get("issue", ""), "detail": f"[{i.get('severity')}] {i.get('file', '')}",
+             "ref": i} for i in v.get("issues", []) if i.get("severity") in ("blocker", "major")]
+    out += [{"kind": "scope", "text": s, "detail": "reported as scope creep", "ref": s}
+            for s in v.get("scope_creep", [])]
+    return out
+
+
+def drop_refuted(v: dict, refuted: list[dict]) -> dict:
+    """The verdict without findings a validator disproved; approve if nothing blocking is left."""
+    ids = {id(f["ref"]) for f in refuted}
+    evidence = {id(f["ref"]): f.get("evidence", "") for f in refuted}
+    out = dict(v)
+    out["criteria"] = [({**c, "met": True, "evidence": f"validator: {evidence[id(c)]}"} if id(c) in ids else c)
+                       for c in v.get("criteria", [])]
+    out["issues"] = [i for i in v.get("issues", []) if id(i) not in ids]
+    out["scope_creep"] = [s for s in v.get("scope_creep", []) if not any(s is f["ref"] for f in refuted)]
+    if refuted and not blocking_findings(out):
+        out["verdict"] = "approve"
+    return out
 
 
 def pick_worker_model(cfg: Config, task: Task) -> str:
@@ -202,6 +322,10 @@ def task_card(t: Task, checks: list[str] | None = None) -> str:
                   if f.startswith(LEGACY_DECISION_PREFIX)]  # answers stored by older versions
     if decisions:
         card += "\n## Decisions already made (binding; do not ask again)\n" + "\n".join(decisions) + "\n"
+    if t.locked_tests:
+        card += ("\n## Acceptance tests (written first by another agent; LOCKED)\n"
+                 "Make the code pass these. You can't edit them; if one is wrong, report \"blocked\".\n"
+                 + "\n".join(f"- `{p}`" for p in t.locked_tests) + "\n")
     if checks:
         card += ("\n## Checks the orchestrator will run (run them before reporting done)\n"
                  + "\n".join(f"- `{c}`" for c in checks) + "\n")
@@ -261,11 +385,18 @@ def _tokens(model_usage: dict | None) -> int:
 class Runner(Protocol):
     async def plan(self, cfg: Config, goal: str, cwd: Path | None = None,
                    graph: Path | None = None) -> AgentResult: ...
-    async def work(self, cfg: Config, task: Task, worktree: Path,
-                   graph: Path | None = None, resume: str | None = None) -> AgentResult: ...
+    async def critique_plan(self, cfg: Config, goal: str, plan: dict, cwd: Path | None = None,
+                            graph: Path | None = None) -> AgentResult: ...
+    async def work(self, cfg: Config, task: Task, worktree: Path, graph: Path | None = None,
+                   resume: str | None = None, env: dict | None = None) -> AgentResult: ...
+    async def write_tests(self, cfg: Config, task: Task, worktree: Path, graph: Path | None = None,
+                          resume: str | None = None, env: dict | None = None) -> AgentResult: ...
     async def review(self, cfg: Config, task: Task, worktree: Path, diff: str,
                      work_report: dict[str, Any], gate_log: str, impact: str = "",
-                     graph: Path | None = None) -> AgentResult: ...
+                     graph: Path | None = None, note: str = "", model: str | None = None,
+                     env: dict | None = None) -> AgentResult: ...
+    async def validate(self, cfg: Config, task: Task, worktree: Path, diff: str, finding: dict,
+                       env: dict | None = None) -> AgentResult: ...
 
 
 def _graph_opts(cfg: Config, graph: Path | None, base_tools: list[str]) -> tuple[dict, list[str], str]:
@@ -355,59 +486,116 @@ class ClaudeRunner:
         return await self._run(f"Goal:\n{goal}\n\nExplore the repository, then produce the plan.",
                                opts, "planner")
 
-    async def work(self, cfg: Config, task: Task, worktree: Path,
-                   graph: Path | None = None, resume: str | None = None) -> AgentResult:
-        """Run the worker. With `resume` (and a stored session), continue that session
-        with the given message instead of starting cold: the agent keeps its context."""
+    def _editor_options(self, cfg: Config, task: Task, worktree: Path, graph: Path | None,
+                        resume: str | None, env: dict | None, model: str, append: str,
+                        schema: dict, locked: list[str] | None = None, stop_gate: bool = False):
+        """Options for an agent that edits files in the worktree (worker, test writer)."""
         from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
         from .gates import make_stop_gate
         tools = ["Read", "Write", "Edit", "Glob", "Grep", "Bash"]
         servers, allowed, guide = _graph_opts(cfg, graph, tools)
         sandbox = sandbox_settings(cfg)
-        hooks = {"PreToolUse": [HookMatcher(hooks=[make_worker_guard(worktree)])]}
+        hooks = {"PreToolUse": [HookMatcher(hooks=[make_worker_guard(worktree, locked)])]}
         fast = [g for g in cfg.gates if g.fast]
-        if cfg.gates_on_stop and fast:
-            hooks["Stop"] = [HookMatcher(hooks=[make_stop_gate(fast, worktree)],
+        if stop_gate and cfg.gates_on_stop and fast:
+            hooks["Stop"] = [HookMatcher(hooks=[make_stop_gate(fast, worktree, env=env)],
                                          timeout=sum(g.timeout_s for g in fast) + 30)]
-        opts = ClaudeAgentOptions(
-            cwd=str(worktree),
-            model=pick_worker_model(cfg, task),
+        return ClaudeAgentOptions(
+            cwd=str(worktree), model=model,
             system_prompt={"type": "preset", "preset": "claude_code",
-                           "append": WORKER_APPEND + (SANDBOX_NOTE if sandbox else "")
-                           + guide + _context(cfg)},
+                           "append": append + (SANDBOX_NOTE if sandbox else "") + guide + _context(cfg)},
             tools=tools, allowed_tools=allowed, permission_mode="acceptEdits",
             mcp_servers=servers, strict_mcp_config=True,
             setting_sources=["project"],  # picks up the repo's CLAUDE.md
             max_turns=cfg.worker_max_turns, max_budget_usd=cfg.task_budget_usd,
-            env=agent_env(), sandbox=sandbox, hooks=hooks,
-            output_format={"type": "json_schema", "schema": WORK_SCHEMA},
+            env={**agent_env(), **(env or {})}, sandbox=sandbox, hooks=hooks,
+            output_format={"type": "json_schema", "schema": schema},
             resume=task.session_id if (resume and task.session_id) else None,
             session_id=None if (resume and task.session_id) else _new_session(),
         )
+
+    async def work(self, cfg: Config, task: Task, worktree: Path, graph: Path | None = None,
+                   resume: str | None = None, env: dict | None = None) -> AgentResult:
+        """Run the worker. With `resume` (and a stored session), continue that session
+        with the given message instead of starting cold: the agent keeps its context."""
+        opts = self._editor_options(cfg, task, worktree, graph, resume, env, pick_worker_model(cfg, task),
+                                    WORKER_APPEND, WORK_SCHEMA, locked=task.locked_tests, stop_gate=True)
         prompt = resume if (resume and task.session_id) else task_card(task, gate_commands(cfg))
         return await self._run(prompt, opts, task.id)
 
+    async def write_tests(self, cfg: Config, task: Task, worktree: Path, graph: Path | None = None,
+                          resume: str | None = None, env: dict | None = None) -> AgentResult:
+        """Test-first: write failing acceptance tests for the card (its own session id is
+        returned; the caller keeps it separate from the worker's)."""
+        opts = self._editor_options(cfg, task, worktree, graph, resume, env, cfg.test_writer_model,
+                                    TEST_WRITER_APPEND, TESTS_SCHEMA)
+        prompt = resume if (resume and task.session_id) else (
+            task_card(task) + "\n\nWrite the acceptance tests for this card now (tests only).")
+        return await self._run(prompt, opts, f"{task.id}:tests")
+
+    def _checker_options(self, cfg: Config, worktree: Path, graph: Path | None, model: str,
+                         system: str, schema: dict, env: dict | None, max_turns: int):
+        """Options for an agent that reads and may run commands but never edits (reviewer, validator)."""
+        from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
+        shell = cfg.review.reviewer_shell
+        base = ["Read", "Glob", "Grep"] + (["Bash"] if shell else [])
+        servers, allowed, guide = _graph_opts(cfg, graph, base)
+        sandbox = sandbox_settings(cfg) if shell else None
+        guard = make_reviewer_guard(worktree) if shell else make_read_guard(worktree)
+        return ClaudeAgentOptions(
+            cwd=str(worktree), model=model,
+            system_prompt=system + (SANDBOX_NOTE if sandbox else "") + guide + _context(cfg),
+            tools=base, allowed_tools=allowed, mcp_servers=servers, strict_mcp_config=True,
+            setting_sources=["project"], max_turns=max_turns, max_budget_usd=cfg.task_budget_usd,
+            session_id=_new_session(), env={**agent_env(), **(env or {})}, sandbox=sandbox,
+            hooks={"PreToolUse": [HookMatcher(hooks=[guard])]},
+            output_format={"type": "json_schema", "schema": schema},
+        )
+
     async def review(self, cfg: Config, task: Task, worktree: Path, diff: str,
                      work_report: dict[str, Any], gate_log: str, impact: str = "",
-                     graph: Path | None = None) -> AgentResult:
-        from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
+                     graph: Path | None = None, note: str = "", model: str | None = None,
+                     env: dict | None = None) -> AgentResult:
         impact_block = (f"## Impact (from the code graph: code outside this diff that depends on "
                         f"changed symbols; check these still work)\n{impact}\n\n" if impact else "")
-        prompt = (f"{task_card(task)}\n\n## Worker's report\n```json\n{json.dumps(work_report, indent=2)}\n```\n\n"
+        note_block = f"## Context for this review\n{note}\n\n" if note else ""
+        prompt = (f"{task_card(task)}\n\n{note_block}## Worker's report\n```json\n"
+                  f"{json.dumps(work_report, indent=2)}\n```\n\n"
                   f"## Automated gates\n{gate_log}\n\n{impact_block}## Diff\n```diff\n{diff}\n```\n\n"
-                  "Read surrounding code as needed, then give your verdict.")
+                  "Read surrounding code and run what helps, then give your verdict.")
+        opts = self._checker_options(cfg, worktree, graph, model or cfg.reviewer_model, REVIEWER_SYSTEM,
+                                     REVIEW_SCHEMA, env, max_turns=40)
+        return await self._run(prompt, opts, f"{task.id}:review")
+
+    async def validate(self, cfg: Config, task: Task, worktree: Path, diff: str, finding: dict,
+                       env: dict | None = None) -> AgentResult:
+        what = {"criterion": "Reviewer says this acceptance criterion is NOT met",
+                "issue": "Reviewer reports this blocking problem",
+                "scope": "Reviewer says this is scope creep (outside the card)"}[finding["kind"]]
+        prompt = (f"{task_card(task)}\n\n## Finding to verify\n{what}:\n{finding['text']}\n"
+                  f"({finding.get('detail', '')})\n\n## Diff\n```diff\n{diff}\n```\n\n"
+                  "Verify this one finding, then answer.")
+        opts = self._checker_options(cfg, worktree, None, cfg.validator_model, VALIDATOR_SYSTEM,
+                                     VALIDATE_SCHEMA, env, max_turns=25)
+        return await self._run(prompt, opts, f"{task.id}:validate")
+
+    async def critique_plan(self, cfg: Config, goal: str, plan: dict, cwd: Path | None = None,
+                            graph: Path | None = None) -> AgentResult:
+        from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
         base = ["Read", "Glob", "Grep"]
         servers, allowed, guide = _graph_opts(cfg, graph, base)
+        root = cwd or cfg.repo
         opts = ClaudeAgentOptions(
-            cwd=str(worktree), model=cfg.reviewer_model,
-            system_prompt=REVIEWER_SYSTEM + guide + _context(cfg),
+            cwd=str(root), model=cfg.planner_model,
+            system_prompt=CRITIC_SYSTEM + guide + _context(cfg),
             tools=base, allowed_tools=allowed, mcp_servers=servers, strict_mcp_config=True,
-            setting_sources=["project"], max_turns=40, max_budget_usd=cfg.task_budget_usd,
-            session_id=_new_session(), env=agent_env(),
-            hooks={"PreToolUse": [HookMatcher(hooks=[make_read_guard(worktree)])]},
-            output_format={"type": "json_schema", "schema": REVIEW_SCHEMA},
+            setting_sources=["project"], max_turns=40, session_id=_new_session(),
+            max_budget_usd=cfg.task_budget_usd * 2, env=agent_env(),
+            hooks={"PreToolUse": [HookMatcher(hooks=[make_read_guard(Path(root))])]},
+            output_format={"type": "json_schema", "schema": CRITIC_SCHEMA},
         )
-        return await self._run(prompt, opts, f"{task.id}:review")
+        prompt = f"Goal:\n{goal}\n\n## Draft plan\n```json\n{json.dumps(plan, indent=2)}\n```"
+        return await self._run(prompt, opts, "critic")
 
 
 def gate_commands(cfg: Config) -> list[str]:

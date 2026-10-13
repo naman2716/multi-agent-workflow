@@ -52,8 +52,8 @@ def _ancestors(tid: str, deps: dict[str, list[str]], seen: set[str] | None = Non
     return seen
 
 
-def build_tasks(plan: dict, id_prefix: str = "T", start: int = 1,
-                graph=None, existing: list[Task] | None = None) -> tuple[list[Task], list[str]]:
+def build_tasks(plan: dict, id_prefix: str = "T", start: int = 1, graph=None,
+                existing: list[Task] | None = None, root: Path | None = None) -> tuple[list[Task], list[str]]:
     """Validate the plan, assign stable ids, and serialize tasks whose files overlap
     (or, with a code graph, whose code calls into each other) — with each other and with
     `existing` cards still open from earlier plans.
@@ -125,13 +125,23 @@ def build_tasks(plan: dict, id_prefix: str = "T", start: int = 1,
                 deps[b].append(e.id)
                 warnings.append(f"{b} now waits for {e.id} (already queued): code coupling ({hits[0]})")
 
+    if root is not None:  # a literal path whose folder doesn't exist is usually a guessed path
+        for tid in order:
+            for p in by_id[tid].get("files_scope", []):
+                if GLOB_CHARS & set(p) or not p.strip():
+                    continue
+                folder = (root / p.strip().rstrip("/")).parent
+                if not folder.exists():
+                    warnings.append(f"{tid}: folder of {p!r} doesn't exist in the repo; check the path")
+
     tasks = [Task(id=tid, title=by_id[tid]["title"], spec=by_id[tid]["spec"],
                   acceptance=by_id[tid].get("acceptance_criteria", []),
                   non_goals=by_id[tid].get("non_goals", []),
                   files_scope=by_id[tid].get("files_scope", []),
                   depends_on=deps[tid],
                   complexity=by_id[tid].get("complexity", "small"),
-                  model=by_id[tid].get("model") or None)
+                  model=by_id[tid].get("model") or None,
+                  test_first=bool(by_id[tid].get("test_first", False)))
              for tid in order]
     return tasks, warnings
 
@@ -146,7 +156,8 @@ def render_plan(tasks: list[Task], warnings: list[str], plan: dict) -> str:
     for t in tasks:
         dep = f"  (after {', '.join(t.depends_on)})" if t.depends_on else ""
         model = f", model={t.model}" if t.model else ""
-        lines.append(f"{t.id} [{t.complexity}{model}] {t.title}{dep}")
+        tf = ", test-first" if t.test_first else ""
+        lines.append(f"{t.id} [{t.complexity}{model}{tf}] {t.title}{dep}")
         lines.append(f"     scope: {', '.join(t.files_scope) or 'unrestricted'}")
         for a in t.acceptance:
             lines.append(f"     ✓ {a}")

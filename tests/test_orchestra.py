@@ -44,18 +44,37 @@ class FakeRunner:
     """script[task_id] = list of callables(wt, call_no) -> AgentResult, one per worker call.
     review[task_id] = list of verdicts per review call."""
 
-    def __init__(self, script, review=None, delay=0.05, delays=None):
+    def __init__(self, script, review=None, delay=0.05, delays=None, validate=None, tests=None):
         self.script, self.review_script, self.delay = script, review or {}, delay
         self.delays = delays or {}
+        self.validate_script, self.tests_script = validate or {}, tests or {}
         self.graphs, self.impacts, self.resumes = {}, {}, {}
         self.calls, self.review_calls = {}, {}
+        self.envs, self.review_notes, self.review_models, self.validations = {}, {}, {}, {}
+        self.tests_calls, self.cards = {}, {}
         self.active, self.max_active = 0, 0
 
     async def plan(self, cfg, goal, cwd=None, graph=None):
         raise NotImplementedError
 
-    async def work(self, cfg, task, wt, graph=None, resume=None):
+    async def critique_plan(self, cfg, goal, plan, cwd=None, graph=None):
+        return AgentResult({"verdict": "ok", "issues": [], "plan": plan}, 0.0)
+
+    async def write_tests(self, cfg, task, wt, graph=None, resume=None, env=None):
+        n = self.tests_calls.get(task.id, 0)
+        self.tests_calls[task.id] = n + 1
+        steps = self.tests_script[task.id]
+        return steps[min(n, len(steps) - 1)](wt, n, task)
+
+    async def validate(self, cfg, task, wt, diff, finding, env=None):
+        self.validations.setdefault(task.id, []).append(finding["text"])
+        confirmed = self.validate_script.get(task.id, True)
+        return AgentResult({"confirmed": confirmed, "evidence": "checked by fake validator"}, 0.05)
+
+    async def work(self, cfg, task, wt, graph=None, resume=None, env=None):
         self.graphs[task.id] = graph
+        self.envs[task.id] = env
+        self.cards.setdefault(task.id, []).append(task)
         self.resumes.setdefault(task.id, []).append(resume)
         n = self.calls.get(task.id, 0)
         self.calls[task.id] = n + 1
@@ -66,8 +85,11 @@ class FakeRunner:
         steps = self.script[task.id]
         return steps[min(n, len(steps) - 1)](wt, n, task)
 
-    async def review(self, cfg, task, wt, diff, report, gate_log, impact="", graph=None):
+    async def review(self, cfg, task, wt, diff, report, gate_log, impact="", graph=None, note="",
+                     model=None, env=None):
         self.impacts[task.id] = impact
+        self.review_notes.setdefault(task.id, []).append(note)
+        self.review_models.setdefault(task.id, []).append(model)
         n = self.review_calls.get(task.id, 0)
         self.review_calls[task.id] = n + 1
         verdicts = self.review_script.get(task.id, ["approve"])

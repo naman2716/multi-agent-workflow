@@ -65,9 +65,12 @@ MIGRATIONS = [  # columns added after v0.1; applied idempotently
     ("resume_note", "TEXT"),     # message to send when resuming that session
     ("decision", "TEXT"),        # JSON: the open (or answered) question for the human
     ("decisions", "TEXT NOT NULL DEFAULT '[]'"),  # JSON: every answered question, kept on the card
+    ("test_first", "INTEGER NOT NULL DEFAULT 0"),  # acceptance tests written first by another agent
+    ("locked_tests", "TEXT NOT NULL DEFAULT '[]'"),  # JSON: those test files, locked for the worker
 ]
 
-JSON_FIELDS = ("acceptance", "non_goals", "files_scope", "depends_on", "feedback", "decisions")
+JSON_FIELDS = ("acceptance", "non_goals", "files_scope", "depends_on", "feedback", "decisions",
+               "locked_tests")
 STATUSES = ("pending", "running", "review", "waiting", "merged", "blocked", "cancelled")
 OPEN_STATUSES = ("pending", "running", "review", "waiting")
 LEASE_TTL_S = 60  # a run lease with no heartbeat for this long is stale
@@ -119,6 +122,8 @@ class Task:
     resume_note: str | None = None
     decision: dict | None = None
     decisions: list[dict] = field(default_factory=list)  # answered questions: question, answer, at
+    test_first: bool = False
+    locked_tests: list[str] = field(default_factory=list)
     status: str = "pending"
     attempts: int = 0
     feedback: list[str] = field(default_factory=list)
@@ -139,6 +144,7 @@ class Task:
         for f in JSON_FIELDS:
             d[f] = json.loads(d[f] or "[]")
         d["decision"] = json.loads(d["decision"]) if d.get("decision") else None
+        d["test_first"] = bool(d.get("test_first"))
         return cls(**d)
 
 
@@ -165,12 +171,12 @@ class Store:
             seq = self.conn.execute("SELECT COALESCE(MAX(seq),0)+1 FROM tasks").fetchone()[0]
             self.conn.execute(
                 """INSERT INTO tasks (id,title,spec,acceptance,non_goals,files_scope,depends_on,
-                   complexity,model,status,attempts,feedback,created_at,updated_at,seq)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,0,'[]',?,?,?)""",
+                   complexity,model,status,attempts,feedback,created_at,updated_at,seq,test_first)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,0,'[]',?,?,?,?)""",
                 (task.id, task.title, task.spec, json.dumps(task.acceptance),
                  json.dumps(task.non_goals), json.dumps(task.files_scope),
                  json.dumps(task.depends_on), task.complexity, task.model, task.status,
-                 now, now, seq),
+                 now, now, seq, 1 if task.test_first else 0),
             )
         self.log(task.id, "created", task.title)
 
@@ -179,17 +185,36 @@ class Store:
         merged = {r[0] for r in self.conn.execute("SELECT id FROM tasks WHERE status='merged'")}
         return [t.id for t in self.all() if t.status == "pending" and all(d in merged for d in t.depends_on)]
 
+    def _chain_weight(self, tasks: list[Task]) -> dict[str, int]:
+        """For each open card: how many open cards depend on it, directly or transitively."""
+        open_ = {t.id: t for t in tasks if t.status in OPEN_STATUSES}
+        dependents: dict[str, set[str]] = {i: set() for i in open_}
+        for t in open_.values():
+            for d in t.depends_on:
+                if d in dependents:
+                    dependents[d].add(t.id)
+
+        def reach(i: str, seen: set[str]) -> set[str]:
+            for j in dependents.get(i, ()):
+                if j not in seen:
+                    seen.add(j)
+                    reach(j, seen)
+            return seen
+        return {i: len(reach(i, set())) for i in open_}
+
     def claim_ready(self, limit: int) -> list[Task]:
-        """Atomically claim up to `limit` pending tasks whose dependencies are all merged."""
+        """Atomically claim up to `limit` pending tasks whose dependencies are all merged,
+        cards that more work waits on first (longest chain first), then queue order."""
         claimed: list[Task] = []
         with self._lock:
-            rows = self.conn.execute(
-                "SELECT * FROM tasks WHERE status='pending' ORDER BY seq").fetchall()
-            merged = {r[0] for r in self.conn.execute("SELECT id FROM tasks WHERE status='merged'")}
-            for row in rows:
+            tasks = self.all()
+            weight = self._chain_weight(tasks)
+            merged = {t.id for t in tasks if t.status == "merged"}
+            pending = sorted((t for t in tasks if t.status == "pending"),
+                             key=lambda t: (-weight.get(t.id, 0), t.seq))
+            for t in pending:
                 if len(claimed) >= limit:
                     break
-                t = Task.from_row(row)
                 if not all(d in merged for d in t.depends_on):
                     continue
                 now = time.time()

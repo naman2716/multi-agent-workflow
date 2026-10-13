@@ -8,7 +8,11 @@ Two profiles:
                (commit, branch, checkout) is allowed. Pushing to main/master and
                force-pushes are blocked: work reaches main through a reviewed PR.
 
-  readonly     planner and reviewer: only the secret-file read block.
+  readonly     planner and critic: only the secret-file read block.
+  reviewer     reviewer and validators: secret-read block, no file-editing tools, and shell
+               commands checked like a worker's (they may run tests, never change the change).
+
+A worker guard can also lock paths (a test-first card's acceptance tests): edits to them are denied.
 
 Workers use it as an Agent SDK PreToolUse hook (make_worker_guard). Interactive sessions
 use it as a Claude Code PreToolUse command hook: `orchestra hook interactive`, which reads
@@ -57,6 +61,10 @@ READ_TOOLS = {"Read", "Grep", "Glob"}
 _SECRET_DIRS = ("/.ssh/", "/.aws/", "/.gnupg/", "/.config/gcloud/", "/.docker/")
 _SECRET_NAMES = (".netrc", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519")
 _ENV_OK_SUFFIXES = (".example", ".sample", ".template", ".dist", ".defaults")
+_WRITE_CMDS = {"rm", "mv", "cp", "truncate", "chmod", "ln", "touch", "dd", "patch", "tee", "install"}
+_SEGMENTS = re.compile(r"&&|\|\||[;|&\n]")
+LOCKED_MSG = ("{p} is a locked acceptance test written before implementation. Make the code pass "
+              "it; don't edit it. If the test itself is wrong, report status \"blocked\" and say why.")
 
 
 def secret_path(raw: str) -> bool:
@@ -112,10 +120,51 @@ INTERACTIVE_ONLY = [
 WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 
 
-def check(tool: str, args: dict[str, Any], root: Path, profile: str = "worker") -> str | None:
+def _rel(raw: str, root: Path) -> str | None:
+    p = Path(raw)
+    resolved = Path(os.path.normpath(p if p.is_absolute() else root / p))
+    try:
+        return resolved.relative_to(root).as_posix()
+    except ValueError:
+        return None
+
+
+def _locked_hit(tool: str, args: dict[str, Any], root: Path, locked: list[str]) -> str | None:
+    if not locked:
+        return None
+    locked_set = {Path(p).as_posix() for p in locked}
+    if tool in WRITE_TOOLS:
+        rel = _rel(args.get("file_path") or args.get("notebook_path") or "", root)
+        if rel in locked_set:
+            return LOCKED_MSG.format(p=rel)
+    if tool == "Bash":
+        cmd = args.get("command", "")
+        targets = [m.group(2) for rx in (_REDIRECT, _TEE) for m in rx.finditer(cmd)]
+        for seg in _SEGMENTS.split(cmd):  # only the arguments of commands that write files
+            words = [w for w in re.split(r"[\s()'\"]+", seg) if w]
+            while words and "=" in words[0] and not words[0].startswith("-"):
+                words = words[1:]  # leading VAR=value assignments
+            if not words:
+                continue
+            verb = words[0].rsplit("/", 1)[-1]
+            if verb in _WRITE_CMDS or (verb in ("sed", "perl") and any(w.startswith("-i") or
+                                                                       (w.startswith("-") and "i" in w[1:] and verb == "perl")
+                                                                       for w in words[1:])):
+                targets += words[1:]
+        for tok in targets:
+            rel = _rel(tok, root) if tok else None
+            if rel in locked_set:
+                return LOCKED_MSG.format(p=rel)
+    return None
+
+
+def check(tool: str, args: dict[str, Any], root: Path, profile: str = "worker",
+          locked: list[str] | None = None) -> str | None:
     """Return a reason to block the call, or None to allow it."""
     root = root.resolve()
-    if profile in ("worker", "readonly") and tool in READ_TOOLS:
+    if (hit := _locked_hit(tool, args, root, locked or [])):
+        return hit
+    if profile in ("worker", "readonly", "reviewer") and tool in READ_TOOLS:
         for cand in (args.get("file_path"), args.get("path"), args.get("glob"),
                      args.get("pattern") if tool == "Glob" else None):
             if cand and secret_path(str(cand)):
@@ -123,6 +172,8 @@ def check(tool: str, args: dict[str, Any], root: Path, profile: str = "worker") 
                         "context; never copy credentials into code or reports.")
     if profile == "readonly":
         return None
+    if profile == "reviewer" and tool in WRITE_TOOLS:
+        return "Reviewers don't edit files; report the problem in your verdict instead."
     if tool in WRITE_TOOLS:
         raw = args.get("file_path") or args.get("notebook_path") or ""
         p = Path(raw)
@@ -142,19 +193,20 @@ def check(tool: str, args: dict[str, Any], root: Path, profile: str = "worker") 
                     "Use environment variables / config, never literal credentials.")
     if tool == "Bash":
         cmd = args.get("command", "")
-        rules = DESTRUCTIVE + (WORKER_ONLY if profile == "worker" else INTERACTIVE_ONLY)
+        strict = profile in ("worker", "reviewer")
+        rules = DESTRUCTIVE + (WORKER_ONLY if strict else INTERACTIVE_ONLY)
         for pat, why in rules:
             if pat.search(cmd):
                 return f"Blocked command: {why}."
-        if profile == "worker":
+        if strict:
             return _bash_worker_checks(cmd, root)
     return None
 
 
-def _make_guard(root: Path, profile: str):
+def _make_guard(root: Path, profile: str, locked: list[str] | None = None):
     async def guard(input_data: dict[str, Any], tool_use_id: str | None, context: Any) -> dict[str, Any]:
         reason = check(input_data.get("tool_name", ""), input_data.get("tool_input", {}) or {},
-                       root, profile)
+                       root, profile, locked)
         if reason:
             return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
                                            "permissionDecision": "deny",
@@ -163,9 +215,14 @@ def _make_guard(root: Path, profile: str):
     return guard
 
 
-def make_worker_guard(worktree: Path):
-    """Agent SDK PreToolUse hook for unattended workers."""
-    return _make_guard(worktree, "worker")
+def make_worker_guard(worktree: Path, locked: list[str] | None = None):
+    """Agent SDK PreToolUse hook for unattended workers (optionally with locked paths)."""
+    return _make_guard(worktree, "worker", locked)
+
+
+def make_reviewer_guard(worktree: Path):
+    """PreToolUse hook for the reviewer and validators: may run commands, never edit."""
+    return _make_guard(worktree, "reviewer")
 
 
 def make_read_guard(root: Path):

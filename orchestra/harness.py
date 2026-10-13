@@ -61,6 +61,7 @@ def _plan_format() -> str:
     "files_scope": ["src/exact/path.ts", "src/dir/**"],
     "depends_on": ["other-slug"],
     "complexity": "small | large",
+    "test_first": false,
     "model": "optional override, e.g. opus | sonnet | haiku; omit to use the defaults"
   }],
   "open_questions": []
@@ -119,7 +120,10 @@ any agent writes code. Tight cards are the most important quality gate in the sy
    - vertical slices, each reviewable as one small diff (aim under ~300 changed lines);
    - `files_scope` specific; cards that could run at the same time must not share files;
    - shared foundations (schema, types, interfaces) first, dependents list them in `depends_on`;
-   - acceptance criteria are concrete and testable; `non_goals` name tempting extras.
+   - acceptance criteria are concrete and testable; `non_goals` name tempting extras;
+   - `test_first: true` on cards that change money, stored data or auth/permissions: a separate
+     agent writes locked acceptance tests from the criteria before the worker starts, so make
+     those criteria precise. Confirm these flags with the user.
    You can delegate a first draft to the `orchestra-planner` subagent, then refine it together.
 4. Show the cards as a short table (id, title, scope, depends on) and iterate with the user.
 5. When the user approves, write the plan to `.orchestra/plan.json` in this shape:

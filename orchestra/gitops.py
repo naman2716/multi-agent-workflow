@@ -108,6 +108,9 @@ class Git:
     async def head(self, ref: str) -> str:
         return await git(self.repo, "rev-parse", ref)
 
+    async def head_of(self, wt: Path) -> str:
+        return await git(wt, "rev-parse", "HEAD")
+
     async def create_worktree(self, task_id: str) -> tuple[Path, str]:
         """Fresh worktree + branch from the current integration head."""
         branch = f"orchestra/task/{task_id}"
@@ -131,7 +134,8 @@ class Git:
         """Commit whatever the worker changed. Returns False if nothing changed."""
         await git(wt, "add", "-A")
         rc, _ = await run(["git", "diff", "--cached", "--quiet"], wt, check=False)
-        if rc == 0:
+        merging = (await run(["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"], wt, check=False))[0] == 0
+        if rc == 0 and not merging:  # a merge is committed even if it kept this side unchanged
             return False
         await git(wt, "-c", "user.name=Orchestra", "-c", "user.email=orchestra@local",
                   "commit", "-q", "--no-verify", "-m", message)
@@ -173,6 +177,61 @@ class Git:
             return False, out
         return True, out
 
+    async def squash_onto(self, wt: Path, base: str, message: str) -> None:
+        """Make the card one commit on top of `base` (also linearizes a resolved merge)."""
+        if await git(wt, "rev-list", "--count", f"{base}..HEAD") == "1" and \
+                await git(wt, "rev-parse", "HEAD^") == await git(wt, "rev-parse", base):
+            return  # already a single commit on base
+        await git(wt, "reset", "-q", "--soft", base)
+        await git(wt, "-c", "user.name=Orchestra", "-c", "user.email=orchestra@local",
+                  "commit", "-q", "--no-verify", "--allow-empty", "-m", message)
+
+    async def start_merge(self, wt: Path, ref: str) -> list[str] | None:
+        """Merge `ref` into the worktree without committing. Returns the conflicted files
+        ([] when the merge applied cleanly), or None if git failed for another reason."""
+        rc, out = await run(["git", "-c", "user.name=Orchestra", "-c", "user.email=orchestra@local",
+                             "merge", "--no-ff", "--no-commit", ref], wt, check=False)
+        conflicted = (await git(wt, "diff", "--name-only", "--diff-filter=U", check=False)).split()
+        if rc != 0 and not conflicted:
+            await self.abort_merge(wt)
+            return None
+        return conflicted
+
+    async def abort_merge(self, wt: Path) -> None:
+        await run(["git", "merge", "--abort"], wt, check=False)
+
+    async def commit_merge(self, wt: Path, message: str) -> None:
+        await git(wt, "add", "-A")
+        await git(wt, "-c", "user.name=Orchestra", "-c", "user.email=orchestra@local",
+                  "commit", "-q", "--no-verify", "-m", message)
+
+    async def changed_files(self, wt: Path, since: str, deleted: bool = False) -> list[str]:
+        """Files changed since `since` (without deletions), or only the deleted ones."""
+        flt = "--diff-filter=D" if deleted else "--diff-filter=d"
+        return [f for f in (await git(wt, "diff", "--name-only", flt, f"{since}...HEAD")).splitlines() if f]
+
+    async def revert_paths(self, wt: Path, ref: str, paths: list[str]) -> None:
+        """Put `paths` back to their state at `ref` (deleting files that didn't exist there)."""
+        for p in paths:
+            rc, _ = await run(["git", "cat-file", "-e", f"{ref}:{p}"], wt, check=False)
+            if rc == 0:
+                await git(wt, "checkout", ref, "--", p)
+            elif (wt / p).exists():
+                (wt / p).unlink()
+
+    async def detached_worktree(self, name: str, ref: str) -> Path:
+        """A read-only-by-convention worktree at `ref` (e.g. for planning against integration)."""
+        path = self.root / name
+        head = await git(self.repo, "rev-parse", ref)
+        if (path / ".git").exists():
+            await git(path, "checkout", "-q", "--detach", "--force", head)
+            await git(path, "clean", "-fdq", check=False)
+        else:
+            self.root.mkdir(parents=True, exist_ok=True)
+            await git(self.repo, "worktree", "prune", check=False)
+            await git(self.repo, "worktree", "add", "-q", "--detach", str(path), head)
+        return path
+
     async def fast_forward_integration(self, wt: Path, expected_old: str) -> None:
         new = await git(wt, "rev-parse", "HEAD")
         # CAS: fails if the integration branch moved since we rebased.
@@ -181,3 +240,18 @@ class Git:
     @property
     def merge_lock(self) -> asyncio.Lock:
         return self._merge_lock
+
+
+async def clone_into(src: Path, dst: Path) -> bool:
+    """Copy-on-write copy of a directory (APFS clonefile on macOS, reflink where supported
+    on Linux, plain copy otherwise). Returns False if it failed."""
+    import platform
+    if not src.exists() or dst.exists():
+        return False
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    cmd = ["cp", "-c", "-R", str(src), str(dst)] if platform.system() == "Darwin" \
+        else ["cp", "-R", "--reflink=auto", str(src), str(dst)]
+    rc, _ = await run(cmd, dst.parent, timeout=600, check=False)
+    if rc != 0 and dst.exists():
+        shutil.rmtree(dst, ignore_errors=True)
+    return rc == 0

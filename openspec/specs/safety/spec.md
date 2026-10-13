@@ -19,3 +19,10 @@ worktree (except `/dev/null` and temp), and reads of `.env` and credential files
 #### Scenario: Moving the integration ref
 - **WHEN** a worker runs `git branch -f orchestra/integration HEAD`
 - **THEN** the command is denied with a reason
+
+### Requirement: Reviewer shell can't change the change
+Reviewer and validator shell commands SHALL be sandboxed and guarded like a worker's, with no
+file-editing tools, and anything they leave in the worktree SHALL be discarded.
+
+### Requirement: Implementers can't edit locked tests
+The worker guard SHALL deny edits to a card's locked acceptance test files.
