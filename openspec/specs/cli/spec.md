@@ -12,3 +12,7 @@ refuse running or review cards while a live run holds the lease, unless `--force
 
 ### Requirement: Status shows lifetime and per-run spend
 `orchestra status` SHALL show lifetime spend, the last run's spend and the per-run cap.
+
+### Requirement: Flag a card test-first
+`orchestra test-first <ID>` SHALL set the flag on a card that hasn't started an attempt, and
+`--off` SHALL clear it.

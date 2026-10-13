@@ -7,19 +7,23 @@ branch for you to PR. Built from the patterns in Karun Japhet's
 *Multi-Agent Development Workflows with Claude Code*, adapted to run unattended.
 
 ```
-goal ─► Planner (Opus, read-only) ─► task graph  ──(you approve)──►  queue (SQLite)
-                                                                      │  ready = deps merged
-              ┌───────────────────────────────────────────────────────┤  up to N in parallel
-              ▼                                                       ▼
-   fresh worktree from integration                          fresh worktree …
-   Worker (Sonnet/Opus, fenced by hooks) → structured report
-   commit → gates: secrets · diff size · file scope · your lint/typecheck/tests
-        fail → feedback → worker fixes (same attempt, ≤2 rounds)
-   Reviewer (separate context, read-only) → criteria · scope creep · issues
-        reject → feedback → fresh attempt (≤ max_attempts) → else BLOCKED for a human
-   [merge lock] rebase on integration → re-gate if base moved → CAS fast-forward
+goal ─► Planner (Opus, read-only, at the integration head) ─► Critic ─► task graph
+        ──(you approve)──►  queue (SQLite)   ready = deps merged, longest chain first
+              ┌──────────────────────────────────┤  up to N in parallel, one env slot each
               ▼
-   orchestra/integration  ──► you review, open PR into main
+   fresh worktree from integration (+ cloned deps, setup_cmd)
+   [test-first cards] test writer → failing acceptance tests → locked
+   Worker (sandboxed, fenced by hooks) → structured report
+   commit → gates: secrets · conflict markers · diff size · scope · your lint/typecheck/tests
+        fail → feedback → worker fixes (same session, ≤2 rounds)
+   squash to one commit → Reviewer (other model family, can run tests, never edits)
+        blocking findings → validators confirm or refute each
+        fixable reject → worker revises in the same session → review again
+        wrong approach → fresh attempt (≤ max_attempts) → else BLOCKED for a human
+   [merge lock] rebase on integration → re-gate if base moved → CAS fast-forward
+        conflict → worker resolves markers in its session → gates → review → merge
+              ▼
+   orchestra/integration (one commit per card) ──► you review, open PR into main
 ```
 
 ## Why it's built this way
@@ -28,10 +32,12 @@ goal ─► Planner (Opus, read-only) ─► task graph  ──(you approve)─�
 |---|---|
 | Vague cards → scope creep | Planner must emit acceptance criteria, non-goals and `files_scope`; reviewer rejects creep |
 | Agents overwrite each other | One worktree per task; overlapping scopes are auto-serialized in the plan |
-| Agent "marks its own homework" | Reviewer is a separate session that only reads |
+| Agent "marks its own homework" | Reviewer is a separate session on the other model family; for money/data/auth cards a separate agent writes locked acceptance tests first |
+| Reviewer false alarms throw away work | Each blocking finding is verified by a validator; fixable problems are revised in the same session instead of restarting |
 | Silent bad handoffs | Every agent returns schema-validated JSON; handoffs saved in `.orchestra/handoffs/` |
 | Comprehension debt | Diff-size gate (default 600 lines) |
-| Merge races | Serialized merges, rebase + re-gate, compare-and-swap ref update |
+| Merge races | Serialized merges, rebase + re-gate, compare-and-swap ref update; conflicts resolved by the card's own worker |
+| Parallel test runs collide | Each running card gets a slot with its own ports and DB suffix (`[env]`) |
 | Runaway cost / time | Per-agent `max_budget_usd` + `max_turns`, a budget per `orchestra run` |
 | Dangerous actions | OS sandbox for worker shell commands (writes only in the worktree, network only to package registries and GitHub), plus PreToolUse guards: no git state changes, no secrets written or read, no `rm -rf ..` |
 | Reviewer approves its own red flags | An approval with unmet criteria, blocker/major issues or scope creep counts as a rejection |
@@ -57,14 +63,18 @@ pip install "graphifyy[mcp]"               # optional: code knowledge graph (rec
 
 Pick a **profile**, then override single roles if you like (`orchestra.toml` → `[models]`):
 
-| Profile | planner | reviewer | small worker | large worker |
-|---|---|---|---|---|
-| `economy` | sonnet | sonnet | haiku | sonnet |
-| `balanced` *(default)* | opus | sonnet | sonnet | opus |
-| `quality` | opus | opus | sonnet | opus |
+| Profile | planner + critic | reviewer | small worker | large worker | validator, test writer |
+|---|---|---|---|---|---|
+| `economy` | sonnet | sonnet | haiku | sonnet | sonnet |
+| `balanced` *(default)* | opus | sonnet | sonnet | opus | opus |
+| `quality` | opus | opus | sonnet | opus | opus |
 
 The planner runs once per goal, so Opus there is cheap leverage. The reviewer runs on every
-attempt, so it's the main cost driver; that's why `balanced` uses Sonnet for it.
+attempt, so it's the main cost driver; that's why `balanced` uses Sonnet for it. With
+`[review].reviewer_rule = "opposite"` (default) a reviewer of the same family as the card's
+worker is swapped for the other of Opus/Sonnet, so in `balanced` Sonnet-written cards get an
+Opus review. Validators run only when a review would reject; the test writer only on
+`test_first` cards.
 `orchestra models` prints the effective setup. Values can be aliases (`opus`, `sonnet`,
 `haiku`) or full model ids. A card's worker model is chosen, in order, from **its own
 `model` field → escalation after a failed attempt (`escalate_on_retry`) → its complexity.**
@@ -93,6 +103,7 @@ orchestra run -j 3 -v               # parallel workers; -v streams tool calls
 orchestra status                    # queue + spend
 orchestra status T03                # history, feedback, why it was blocked
 orchestra retry T03 --note "Use the existing FCM helper in src/notify"
+orchestra test-first T04            # locked acceptance tests before the worker (or --off)
 git log main..orchestra/integration # then open a PR
 ```
 
@@ -203,6 +214,62 @@ The process must stay alive while it waits. Keep the machine awake
 (macOS: `caffeinate -i orchestra run`), or use `--no-wait` and re-run after the reset.
 If it's interrupted anyway, re-running picks up where it left off.
 
+## Keeping good work: revise, resolve, verify
+
+- **Fixable rejections are revised in place.** The reviewer says whether its findings are
+  `fixable`. If so, they go back to the same worker session (`[review].fix_rounds`, default 1),
+  gates run, and a fresh reviewer checks the revision. Only a wrong approach starts the card over.
+- **Merge conflicts are resolved by the worker.** Each card is squashed to one commit after its
+  gates pass. If it conflicts with work merged meanwhile, Orchestra merges the latest
+  integration into the worktree and the worker resolves the markers in its session
+  (`[review].conflict_rounds`, default 1); gates (incl. a conflict-marker check) and a review of
+  the resolution follow. A whole-change merge that applies cleanly needs no agent.
+- **The reviewer can run code and isn't the author's model.** With `reviewer_rule = "opposite"`
+  Sonnet-written cards are reviewed by Opus and Opus-written by Sonnet. It has sandboxed Bash
+  (`reviewer_shell`) to run tests; it can't edit, and whatever it leaves is discarded.
+- **Rejections are verified.** Each blocking finding (unmet criterion, blocker/major issue,
+  scope creep; up to 5) goes to a validator agent (`validator` model). Only findings it refutes
+  with evidence are dropped; if none remain, the card is approved. Validators run only on
+  rejections.
+
+## Test-first cards
+
+Cards that change money, stored data or auth/permissions get `test_first` from the planner (and
+`/groom`); flip it with `orchestra test-first T03` or `--off`. Before the worker starts, a test
+writer (`test_writer` model) writes failing acceptance tests, only in files matching
+`[quality].test_globs` (anything else it changes, and any deletion, is put back). They are
+committed and **locked**: the worker's guard blocks edits, and Orchestra restores the original
+versions before every gate run, so the gates always check the tests as written. Locked tests
+don't count toward the scope and diff-size gates. Later attempts reuse them. If they already pass
+before implementation, the run log and the reviewer get a warning. The reviewer is also asked to
+check that the change doesn't stop them from running (skip markers, conftest or test-config
+edits); Orchestra doesn't check that itself.
+
+## Per-card environment and faster setup
+
+- Each running card gets a slot (1..concurrency) and `ORCHESTRA_SLOT`, `ORCHESTRA_TASK`,
+  `ORCHESTRA_PORT_BASE` (`port_base + slot * port_span`), `ORCHESTRA_DB_SUFFIX` (`_orch<slot>`),
+  plus your own `[env.vars]` with `{slot}`, `{port_base}`, `{task}` filled in, e.g.
+  `DATABASE_URL = "postgres://localhost/restocare_test_{slot}"`. Setup, gates and every agent
+  of that card see them; point your test config at them so parallel cards don't collide.
+- `[quality].clone_paths = ["node_modules"]` copies those (gitignored) folders from your
+  checkout copy-on-write (APFS clone on macOS); `setup_cmd` is skipped when they all copied and
+  the lockfiles match. Avoid cloning a Python `.venv`: its scripts and editable installs point
+  back into your checkout, so tests could run your checkout's code instead of the card's.
+- A gate can set `changed_cmd = "python -m pytest -q {files}"`: in fix rounds it runs on the
+  changed test files first and fails fast; the full `cmd` still has to pass. "Nothing collected"
+  exits (pytest 4/5) don't count as failures.
+- If the run budget is reached while a card is between rounds (a revision or a conflict to
+  resolve), the card is parked with its worktree and session and continues on the next run.
+
+## Planning
+
+`orchestra plan` drafts against the integration branch (in a read-only `_plan` worktree, or the
+graph worktree), not your checkout. A critic agent (`[planning].critic`) checks coverage, paths,
+ordering, card size, criteria and `test_first`, and its corrected plan replaces the draft when it
+is valid; its notes are printed under "Critic". Scope paths whose folder doesn't exist are
+flagged. Ready cards that more work waits on are dispatched first.
+
 ## Safety: sandbox, guards and the run lease
 
 - **Sandbox (on by default).** Worker shell commands run in Claude Code's OS sandbox (Seatbelt
@@ -277,7 +344,7 @@ orchestra/
   limits.py        usage-limit tracker (pause/resume) and notifications
   cli.py           init / plan / approve / add / run / status / retry / cancel /
                    graph / stats / harness / hook
-tests/             56 tests with scripted fake agents (no API calls); graph tests run
+tests/             77 tests with scripted fake agents (no API calls); graph tests run
                    real graphify and skip without it
 openspec/          specs per module and proposed/archived changes
 ```

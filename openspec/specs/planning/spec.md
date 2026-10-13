@@ -20,3 +20,12 @@ first glob segment) are equal or nested, or when a literal path matches the othe
 #### Scenario: Recursive glob vs file
 - **WHEN** one card has `src/**/*.py` and another `src/api/views.py`
 - **THEN** the second depends on the first
+
+### Requirement: Plans are drafted against the integration head
+The planner and critic SHALL explore a read-only worktree at the integration branch head.
+
+### Requirement: Missing folders are flagged
+A literal scope path whose folder doesn't exist SHALL produce a plan warning.
+
+### Requirement: Risky cards are flagged test-first
+The planner SHALL set `test_first` on cards that change money, stored data, or auth/permissions.

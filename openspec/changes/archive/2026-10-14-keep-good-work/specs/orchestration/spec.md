@@ -34,3 +34,7 @@ its setup command, gates and agents.
 
 ### Requirement: Longest chains start first
 Among ready cards, those with more open cards depending on them SHALL be dispatched first.
+
+### Requirement: Extra rounds respect the run budget and survive pauses
+Revision and conflict rounds SHALL NOT start once the run budget is reached; the card SHALL be
+parked with its worktree, session and round counters and continue on the next run.

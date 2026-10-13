@@ -9,12 +9,13 @@ from __future__ import annotations
 import fnmatch
 import json
 import re
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .config import Config, Gate
-from .gitops import DiffStats, run
+from .gitops import DiffStats, matches_any, run
 
 SECRET_PATTERNS = [
     (re.compile(r"AKIA[0-9A-Z]{16}"), "AWS access key"),
@@ -54,11 +55,23 @@ class GateResult:
     detail: str = ""
 
 
+CONFLICT_MARKER = re.compile(r"^(<<<<<<<|>>>>>>>)( |$)", re.M)
+
+
+# Exit codes a quick check uses for "nothing to run" rather than "tests failed":
+# pytest 4 (usage / path not found) and 5 (no tests collected).
+QUICK_INCONCLUSIVE = {4, 5}
+
+
 async def run_gates(cfg: Config, wt: Path, stats: DiffStats, diff_text: str,
-                    scope: list[str]) -> list[GateResult]:
+                    scope: list[str], env: dict | None = None, quick: bool = False,
+                    exempt: list[str] | None = None) -> list[GateResult]:
     """`diff_text` must be the whole diff (not the reviewer's truncated excerpt): the secret
-    scan reads every added line."""
+    scan reads every added line. `env` is the card's slot environment. With `quick` (fix
+    rounds), a gate's `changed_cmd` runs first on the changed test files and fails fast.
+    `exempt` files (a card's locked acceptance tests) don't count toward size or scope."""
     results: list[GateResult] = []
+    exempt_set = set(exempt or [])
 
     added_lines = "\n".join(l[1:] for l in diff_text.splitlines()
                             if l.startswith("+") and not l.startswith("+++"))
@@ -68,7 +81,14 @@ async def run_gates(cfg: Config, wt: Path, stats: DiffStats, diff_text: str,
     if secrets:
         return results
 
-    counted = stats.counted(cfg.diff_exclude)
+    markers = [m.group(0) for m in CONFLICT_MARKER.finditer(added_lines)]
+    results.append(GateResult(not markers, "conflict_markers",
+                              f"{len(markers)} merge conflict marker line(s) left in the change; "
+                              "resolve every <<<<<<< / ======= / >>>>>>> block" if markers else ""))
+    if markers:
+        return results
+
+    counted = stats.counted(list(cfg.diff_exclude) + sorted(exempt_set))
     skipped = f" (+{stats.lines - counted} in lockfiles/generated files, not counted)" \
         if counted != stats.lines else ""
     too_big = counted > cfg.max_diff_lines
@@ -80,15 +100,24 @@ async def run_gates(cfg: Config, wt: Path, stats: DiffStats, diff_text: str,
         return results
 
     if cfg.enforce_file_scope and scope:
-        outside = [f for f in stats.files if not in_scope(f, scope)]
+        outside = [f for f in stats.files if not in_scope(f, scope) and f not in exempt_set]
         results.append(GateResult(not outside, "file_scope",
                                   f"edited files outside task scope {scope}: {outside}"
                                   if outside else ""))
         if outside:
             return results
 
+    # quick checks only make sense on test files the change touched
+    changed_tests = [f for f in stats.files if (wt / f).exists() and matches_any(f, cfg.test_globs)]
     for gate in cfg.gates:
-        rc, out = await run(gate.cmd, wt, timeout=gate.timeout_s, check=False)
+        if quick and gate.changed_cmd and changed_tests:
+            quick_cmd = gate.changed_cmd.replace("{files}", " ".join(shlex.quote(f) for f in changed_tests))
+            rc, out = await run(quick_cmd, wt, timeout=gate.timeout_s, check=False, env=env)
+            if rc != 0 and rc not in QUICK_INCONCLUSIVE:
+                results.append(GateResult(False, f"{gate.name} (changed files)",
+                                          f"exit {rc}\n{out[-3000:]}"))
+                break
+        rc, out = await run(gate.cmd, wt, timeout=gate.timeout_s, check=False, env=env)
         tail = out[-3000:]
         results.append(GateResult(rc == 0, gate.name, "" if rc == 0 else f"exit {rc}\n{tail}"))
         if rc != 0:
@@ -136,7 +165,7 @@ def find_report(input_data: dict[str, Any], tail_lines: int = 400) -> dict | Non
     return None
 
 
-def make_stop_gate(gates: list[Gate], worktree: Path, max_blocks: int = 1):
+def make_stop_gate(gates: list[Gate], worktree: Path, max_blocks: int = 1, env: dict | None = None):
     """Agent SDK Stop hook: when the worker reports `done`, run the fast gates in its worktree
     and, if one fails, send it back (at most `max_blocks` times). Never blocks on its own
     errors, on a non-`done` report, or when it can't find the report."""
@@ -150,7 +179,7 @@ def make_stop_gate(gates: list[Gate], worktree: Path, max_blocks: int = 1):
             if not report or report.get("status") != "done":
                 return {}
             for g in gates:
-                rc, out = await run(g.cmd, worktree, timeout=g.timeout_s, check=False)
+                rc, out = await run(g.cmd, worktree, timeout=g.timeout_s, check=False, env=env)
                 if rc != 0:
                     state["blocks"] += 1
                     return {"decision": "block",

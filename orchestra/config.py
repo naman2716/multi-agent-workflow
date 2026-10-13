@@ -15,6 +15,9 @@ class Gate:
     cmd: str
     timeout_s: int = 900
     fast: bool = False  # cheap check (lint, typecheck); used by the optional Stop-hook pre-check
+    # Optional quick variant run first in fix rounds, with {files} = the changed files
+    # (shell-quoted), e.g. "python -m pytest -q {files}". The full cmd must still pass.
+    changed_cmd: str = ""
 
 
 FAST_GATE_NAMES = ("lint", "typecheck", "type-check", "analyze", "vet", "format")
@@ -54,11 +57,41 @@ class Sandbox:
 MODEL_PROFILES = {
     # Opus is the most capable and the most expensive; on a subscription it also uses up
     # usage limits fastest. The reviewer runs once per attempt, so it matters most.
-    "economy":  {"planner": "sonnet", "reviewer": "sonnet", "small_worker": "haiku",  "large_worker": "sonnet"},
-    "balanced": {"planner": "opus",   "reviewer": "sonnet", "small_worker": "sonnet", "large_worker": "opus"},
-    "quality":  {"planner": "opus",   "reviewer": "opus",   "small_worker": "sonnet", "large_worker": "opus"},
+    "economy":  {"planner": "sonnet", "reviewer": "sonnet", "small_worker": "haiku",  "large_worker": "sonnet",
+                 "validator": "sonnet", "test_writer": "sonnet"},
+    "balanced": {"planner": "opus",   "reviewer": "sonnet", "small_worker": "sonnet", "large_worker": "opus",
+                 "validator": "opus", "test_writer": "opus"},
+    "quality":  {"planner": "opus",   "reviewer": "opus",   "small_worker": "sonnet", "large_worker": "opus",
+                 "validator": "opus", "test_writer": "opus"},
 }
 DEFAULT_PROFILE = "balanced"
+
+DEFAULT_TEST_GLOBS = ["test_*.py", "*_test.py", "tests/*", "*/tests/*", "test/*", "*/test/*",
+                      "*/__tests__/*", "__tests__/*", "*.test.*", "*.spec.*", "*_test.go", "*_test.dart",
+                      "spec/*", "*/spec/*"]
+
+
+@dataclass
+class Review:
+    fix_rounds: int = 1          # in-session revisions after a fixable rejection
+    conflict_rounds: int = 1     # in-session merge-conflict resolutions
+    validate: bool = True        # validator agents check blocking findings before a reject counts
+    max_validations: int = 5
+    reviewer_rule: str = "opposite"  # "opposite": reviewer model family differs from the worker's
+    reviewer_shell: bool = True  # reviewer/validators may run sandboxed shell commands (tests)
+
+
+@dataclass
+class EnvSettings:
+    """Per-slot environment for each running card (setup, gates and agents)."""
+    port_base: int = 41000
+    port_span: int = 100
+    vars: dict[str, str] = field(default_factory=dict)  # values may use {slot} {port_base} {task}
+
+
+@dataclass
+class Planning:
+    critic: bool = True          # a critic agent reviews every plan and returns a corrected one
 
 
 @dataclass
@@ -89,6 +122,8 @@ class Config:
     reviewer_model: str = "sonnet"
     small_worker_model: str = "sonnet"
     large_worker_model: str = "opus"
+    validator_model: str = "opus"
+    test_writer_model: str = "opus"
     escalate_on_retry: bool = True  # retry a failed small card on the large-worker model
 
     max_diff_lines: int = 600
@@ -98,6 +133,12 @@ class Config:
     gates: list[Gate] = field(default_factory=list)
     gates_on_stop: bool = False  # Stop hook runs fast gates before a worker may finish (opt-in)
     sandbox: Sandbox = field(default_factory=Sandbox)
+    clone_paths: list[str] = field(default_factory=list)  # copy-on-write from your checkout, e.g. node_modules
+    skip_setup_if_cloned: bool = True
+    test_globs: list[str] = field(default_factory=lambda: list(DEFAULT_TEST_GLOBS))
+    review: Review = field(default_factory=Review)
+    env: EnvSettings = field(default_factory=EnvSettings)
+    planning: Planning = field(default_factory=Planning)
     project_context: str = ""  # extra conventions every agent should know
     graph: GraphSettings = field(default_factory=GraphSettings)
     limits: Limits = field(default_factory=Limits)
@@ -128,6 +169,9 @@ class Config:
         gr = data.get("graph", {})
         lim = data.get("limits", {})
         sb = data.get("sandbox", {})
+        rv = data.get("review", {})
+        ev = data.get("env", {})
+        pl = data.get("planning", {})
         profile = m.get("profile", DEFAULT_PROFILE)
         if profile not in MODEL_PROFILES:
             raise ValueError(f"unknown model profile {profile!r}; use one of {list(MODEL_PROFILES)}")
@@ -148,6 +192,8 @@ class Config:
             reviewer_model=pm["reviewer"],
             small_worker_model=pm["small_worker"],
             large_worker_model=pm["large_worker"],
+            validator_model=pm["validator"],
+            test_writer_model=pm["test_writer"],
             escalate_on_retry=m.get("escalate_on_retry", True),
             max_diff_lines=q.get("max_diff_lines", 600),
             diff_exclude=q.get("diff_exclude", list(DEFAULT_DIFF_EXCLUDE)),
@@ -156,6 +202,12 @@ class Config:
             gates=gates,
             gates_on_stop=q.get("gates_on_stop", False),
             sandbox=Sandbox(**{k: v for k, v in sb.items() if k in Sandbox.__dataclass_fields__}),
+            clone_paths=q.get("clone_paths", []),
+            skip_setup_if_cloned=q.get("skip_setup_if_cloned", True),
+            test_globs=q.get("test_globs", list(DEFAULT_TEST_GLOBS)),
+            review=Review(**{k: v for k, v in rv.items() if k in Review.__dataclass_fields__}),
+            env=EnvSettings(**{k: v for k, v in ev.items() if k in EnvSettings.__dataclass_fields__}),
+            planning=Planning(**{k: v for k, v in pl.items() if k in Planning.__dataclass_fields__}),
             project_context=data.get("project", {}).get("context", ""),
             graph=GraphSettings(enabled=gr.get("enabled", False), python=gr.get("python", ""),
                                 refresh_timeout_s=gr.get("refresh_timeout_s", 900)),
@@ -189,7 +241,8 @@ def detect_gates(repo: Path) -> tuple[str, list[Gate]]:
         setup = setup or "flutter pub get"
         gates += [Gate("analyze", "flutter analyze"), Gate("test", "flutter test")]
     if (repo / "pyproject.toml").exists() or (repo / "requirements.txt").exists():
-        gates += [Gate("lint", "ruff check ."), Gate("test", "python -m pytest -q")]
+        gates += [Gate("lint", "ruff check ."),
+                  Gate("test", "python -m pytest -q", changed_cmd="python -m pytest -q {files}")]
     if (repo / "go.mod").exists():
         gates += [Gate("vet", "go vet ./..."), Gate("test", "go test ./...")]
     for g in gates:
@@ -211,16 +264,20 @@ ask_in_terminal = true     # agents' questions pop up in the terminal during `or
 decision_wait_minutes = 60 # in the background, keep running this long for answers given elsewhere
 
 [models]
-# profile sets all four roles at once:
-#   economy  = planner sonnet, reviewer sonnet, small haiku,  large sonnet   (cheapest)
-#   balanced = planner opus,   reviewer sonnet, small sonnet, large opus     (default)
-#   quality  = planner opus,   reviewer opus,   small sonnet, large opus
+# profile sets all roles at once:
+#   economy  = planner sonnet, reviewer sonnet, small haiku,  large sonnet, validator/test writer sonnet
+#   balanced = planner opus,   reviewer sonnet, small sonnet, large opus,   validator/test writer opus
+#   quality  = planner opus,   reviewer opus,   small sonnet, large opus,   validator/test writer opus
+# With [review].reviewer_rule = "opposite", a reviewer of the same family as the card's worker is
+# swapped for the other of opus/sonnet (balanced: Sonnet work -> Opus review, Opus work -> Sonnet).
 profile = "balanced"
 # Override any single role (alias like opus/sonnet/haiku, or a full model id):
 # planner = "opus"
 # reviewer = "sonnet"
 # small_worker = "sonnet"
 # large_worker = "opus"
+# validator = "opus"
+# test_writer = "opus"
 # A card can also set its own worker model with a "model" field.
 escalate_on_retry = true   # a failed small card retries on large_worker
 
@@ -244,10 +301,35 @@ max_diff_lines = 600       # reject oversized diffs (comprehension debt)
 diff_exclude = ["*.lock", "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "pubspec.lock", "go.sum", "poetry.lock", "uv.lock", "Cargo.lock"]
 enforce_file_scope = true  # reject edits outside a task's declared files
 setup_cmd = "{setup}"      # runs once in each new worktree
+# copy these from your checkout into each worktree (copy-on-write on macOS APFS), e.g.
+# ["node_modules"]; setup_cmd is skipped when they copied and the lockfiles match
+clone_paths = []
+skip_setup_if_cloned = true
+# files a test-first card's test writer may create (globs on the path or file name)
+# test_globs = ["test_*.py", "*_test.py", "tests/*", "*.test.*", "*.spec.*", "*_test.go", "*_test.dart"]
 # Opt-in: a Stop hook runs the `fast` gates before a worker may report done, and sends it
 # back once with the failures. Turn on after one live smoke run (see README).
 gates_on_stop = false
 {gates}
+[review]
+fix_rounds = 1             # a fixable rejection goes back to the same worker session this many times
+conflict_rounds = 1        # merge conflicts with newly merged work are resolved by the worker
+validate = true            # a validator agent checks each blocking finding before a rejection counts
+reviewer_rule = "opposite" # or "profile": always use [models].reviewer
+reviewer_shell = true      # reviewer may run tests (sandboxed, no edits)
+
+[env]
+# Each running card gets a slot (1..concurrency) and these variables, for setup, gates and agents:
+# ORCHESTRA_SLOT, ORCHESTRA_TASK, ORCHESTRA_PORT_BASE (port_base + slot * port_span),
+# ORCHESTRA_DB_SUFFIX (_orch<slot>). Point your test config at them to avoid port/DB clashes.
+port_base = 41000
+port_span = 100
+# [env.vars]
+# DATABASE_URL = "postgres://localhost/restocare_test_{{slot}}"
+
+[planning]
+critic = true              # a critic agent checks each plan and returns a corrected one
+
 [sandbox]
 # Worker shell commands run in Claude Code's OS sandbox (Seatbelt on macOS): writes only in
 # the worktree, temp and the caches below; network only to these hosts. setup_cmd and gates
@@ -281,4 +363,5 @@ def render_gates(gates: list[Gate]) -> str:
         return ('# Add your checks. Fastest first. Exit code 0 = pass.\n'
                 '# [[quality.gates]]\n# name = "test"\n# cmd = "npm test"\n')
     return "".join(f'[[quality.gates]]\nname = "{g.name}"\ncmd = "{g.cmd}"\n'
-                   + ("fast = true\n" if g.fast else "") + "\n" for g in gates)
+                   + ("fast = true\n" if g.fast else "")
+                   + (f'changed_cmd = "{g.changed_cmd}"\n' if g.changed_cmd else "") + "\n" for g in gates)

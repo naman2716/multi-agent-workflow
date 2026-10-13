@@ -105,6 +105,42 @@ Per attempt at most `1 + fix_rounds + conflict_rounds` reviews (default 3).
 - `Store.claim_ready` orders ready cards by number of open cards that depend on them
   (transitively), then by sequence.
 
+## As built (differences from the plan above)
+- `clone_paths` entries are cloned only if git ignores them in your checkout; otherwise a warning
+  is logged and the path is skipped (it would end up committed).
+- The "acceptance tests already pass" check runs all gates on the tests-only change, so a lint
+  failure in the new tests also counts as "not passing"; it is only a warning.
+- `orchestra models` shows the validator and test-writer models and which reviewer each worker
+  model gets.
+- The harness plan template has `"test_first": false` (a literal), with the rule in `/groom`'s text.
+
+### Fixes from the independent review of this change (each has a regression test)
+- **Squash race:** the base was read from the integration ref right after creating the worktree.
+  If another card merged in between, squashing onto that newer base reverted its work. The base
+  is now the worktree's own HEAD. (Found while chasing a flaky test; the most serious one.)
+- **Locked tests no longer use a pinned git ref.** Their exact content is snapshotted to
+  `.orchestra/handoffs/<ID>.locked/` and restored by file copy. After a conflict merge the
+  snapshot is retaken, so other cards' merged-in edits to those files survive. A conflict
+  *inside* a locked test can't be resolved by the worker, so it starts a fresh attempt.
+- **Test writer:** only added or edited test files are locked. Its non-test changes and deletions
+  are put back automatically (no retry round). Locked tests are exempt from the scope and
+  diff-size gates.
+- **`changed_cmd`** gets only changed files matching `test_globs`; it is skipped when there are
+  none; exit codes 4/5 ("nothing collected") count as inconclusive, and the full command decides.
+- **Crash during the merge-time re-gate:** `base_commit` is updated right after the rebase, and
+  the saved report records the base its gates passed on. A resumed card re-gates when that differs.
+- **Round counters and review context are persisted** (`meta rounds:<ID>`), so pauses, decisions
+  and crashes don't reset them.
+- **Budget:** a revise or conflict round isn't started once the run budget is reached. The card
+  is parked as pending with its worktree, session and round state, and continues on the next run.
+- Validators run one at a time when they can run tests (they share the card's env slot).
+- The locked-path guard only checks the arguments of file-writing commands and redirect targets
+  (no more blocking `grep "patch" tests/x.py`).
+- A merge is committed even when the resolution kept this side unchanged.
+- Commit message and summary list the first report plus "Later rounds".
+- The reviewer is asked to check that the change doesn't stop locked tests from running (skip
+  markers, conftest or test-config changes). The orchestrator doesn't verify that by itself.
+
 ## Harness
 - `/groom` plan format and rules include `test_first`. The interactive reviewer agent gets the
   updated prompt (it already has Bash for read-only git).
