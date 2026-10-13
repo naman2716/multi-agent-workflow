@@ -8,9 +8,14 @@ Two profiles:
                (commit, branch, checkout) is allowed. Pushing to main/master and
                force-pushes are blocked: work reaches main through a reviewed PR.
 
+  readonly     planner and reviewer: only the secret-file read block.
+
 Workers use it as an Agent SDK PreToolUse hook (make_worker_guard). Interactive sessions
 use it as a Claude Code PreToolUse command hook: `orchestra hook interactive`, which reads
 the hook JSON on stdin and exits 2 with a reason to block.
+
+This is a second layer. The first, for worker shell commands, is the OS sandbox
+(see agents.sandbox_settings); regexes alone can always be bypassed.
 """
 from __future__ import annotations
 
@@ -29,12 +34,75 @@ DESTRUCTIVE = [
     (re.compile(r"curl[^|]*\|\s*(ba)?sh"), "piping remote scripts to a shell"),
     (re.compile(r"\b(npm|yarn|pnpm)\s+publish\b"), "publishing packages"),
 ]
+# `git` followed by any global options (-C dir, -c key=val, --git-dir=..., --no-pager)
+_GIT = r"\bgit(?:\s+(?:-[Cc]\s+\S+|--[\w-]+(?:=\S+)?))*\s+"
+_GIT_STATE = "git state is managed by the orchestrator; just edit files and stop"
 WORKER_ONLY = [
-    (re.compile(r"\bgit\s+(push|checkout|switch|reset\s+--hard|rebase|merge|worktree|branch\s+-[dD]|"
-                r"update-ref|commit|tag|remote|filter-branch|clean\s+-[a-z]*f)"),
-     "git state is managed by the orchestrator; just edit files and stop"),
+    (re.compile(_GIT + r"(push|checkout|switch|reset\s+--hard|rebase|merge|worktree|update-ref|commit|"
+                r"tag|remote|filter-branch|clean\s+-[a-z]*f|stash|symbolic-ref|cherry-pick|revert|am|"
+                r"gc|prune|replace|notes)\b"), _GIT_STATE),
+    (re.compile(_GIT + r"branch\s+(-[a-zA-Z]*[dDfmMcC]\b|--(delete|force|move|copy)\b)"), _GIT_STATE),
+    (re.compile(_GIT + r"config(?!\s+(--get|--get-all|--get-regexp|--list|-l)\b)"),
+     "git config is shared by every worktree of this repository; don't change it"),
     (re.compile(r"\bcd\s+\.\.(/|\s|$)"), "leaving the worktree"),
 ]
+# Shell redirects and other write targets checked against the worktree (worker profile).
+_REDIRECT = re.compile(r"(?:^|[^<>&\d])>>?\s*(['\"]?)([^\s;&|'\"<>()]+)\1")
+_TEE = re.compile(r"\btee\s+(?:-a\s+)?(['\"]?)([^\s;&|'\"]+)\1")
+_CD = re.compile(r"\bcd\s+(['\"]?)([^\s;&|'\"]+)\1")
+_SAFE_ABS = ("/dev/", "/tmp", "/private/tmp", "/private/var/folders", "/var/folders")
+_READ_VERBS = re.compile(r"\b(cat|less|more|head|tail|bat|strings|xxd|base64|od|nl|source|grep|rg|"
+                         r"awk|sed|python\d?(\.\d+)?|node|ruby|perl)\b")
+READ_TOOLS = {"Read", "Grep", "Glob"}
+_SECRET_DIRS = ("/.ssh/", "/.aws/", "/.gnupg/", "/.config/gcloud/", "/.docker/")
+_SECRET_NAMES = (".netrc", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519")
+_ENV_OK_SUFFIXES = (".example", ".sample", ".template", ".dist", ".defaults")
+
+
+def secret_path(raw: str) -> bool:
+    """True for .env files (not .env.example and friends) and credential files/dirs."""
+    s = (raw or "").strip().strip("'\"").replace("\\", "/")
+    if not s:
+        return False
+    name = s.rstrip("/").rsplit("/", 1)[-1]
+    if (name == ".env" or name.startswith(".env.")) and not name.endswith(_ENV_OK_SUFFIXES):
+        return True
+    if name in _SECRET_NAMES or name.endswith(".p12"):
+        return True
+    expanded = "/" + os.path.expanduser(s).lstrip("/") + "/"
+    return any(d in expanded for d in _SECRET_DIRS)
+
+
+def _outside(target: str, root: Path) -> bool:
+    """Would writing to / cd-ing into `target` leave the worktree (temp and /dev are fine)?"""
+    if target.startswith(("$TMPDIR", "${TMPDIR")):
+        return False
+    if target.startswith(("~", "$HOME", "${HOME")):
+        return True
+    if target.startswith("$"):
+        return False  # other variables can't be resolved here; the sandbox covers them
+    p = Path(target)
+    if p.is_absolute() and str(p).startswith(_SAFE_ABS):
+        return False
+    resolved = Path(os.path.normpath(p if p.is_absolute() else root / p))
+    try:
+        resolved.relative_to(root)
+        return False
+    except ValueError:
+        return True
+
+
+def _bash_worker_checks(cmd: str, root: Path) -> str | None:
+    for rx in (_REDIRECT, _TEE):
+        for m in rx.finditer(cmd):
+            if _outside(m.group(2), root):
+                return f"Blocked command: writes outside the worktree ({m.group(2)})."
+    for m in _CD.finditer(cmd):
+        if _outside(m.group(2), root):
+            return f"Blocked command: leaving the worktree ({m.group(2)})."
+    if _READ_VERBS.search(cmd) and any(secret_path(tok) for tok in re.split(r"[\s;&|<>()=]+", cmd)):
+        return "Blocked command: reading secrets (.env or credential files). Use the example file or ask."
+    return None
 INTERACTIVE_ONLY = [
     (re.compile(r"\bgit\s+push\b[^\n;&|]*(\s(-f|--force|--force-with-lease)\b)"), "force push"),
     (re.compile(r"\bgit\s+push\b[^\n;&|]*\b(main|master)\b"),
@@ -47,6 +115,14 @@ WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 def check(tool: str, args: dict[str, Any], root: Path, profile: str = "worker") -> str | None:
     """Return a reason to block the call, or None to allow it."""
     root = root.resolve()
+    if profile in ("worker", "readonly") and tool in READ_TOOLS:
+        for cand in (args.get("file_path"), args.get("path"), args.get("glob"),
+                     args.get("pattern") if tool == "Glob" else None):
+            if cand and secret_path(str(cand)):
+                return (f"Reading secrets is blocked ({cand}). Use .env.example or the project "
+                        "context; never copy credentials into code or reports.")
+    if profile == "readonly":
+        return None
     if tool in WRITE_TOOLS:
         raw = args.get("file_path") or args.get("notebook_path") or ""
         p = Path(raw)
@@ -70,20 +146,31 @@ def check(tool: str, args: dict[str, Any], root: Path, profile: str = "worker") 
         for pat, why in rules:
             if pat.search(cmd):
                 return f"Blocked command: {why}."
+        if profile == "worker":
+            return _bash_worker_checks(cmd, root)
     return None
 
 
-def make_worker_guard(worktree: Path):
-    """Agent SDK PreToolUse hook for unattended workers."""
+def _make_guard(root: Path, profile: str):
     async def guard(input_data: dict[str, Any], tool_use_id: str | None, context: Any) -> dict[str, Any]:
         reason = check(input_data.get("tool_name", ""), input_data.get("tool_input", {}) or {},
-                       worktree, "worker")
+                       root, profile)
         if reason:
             return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
                                            "permissionDecision": "deny",
                                            "permissionDecisionReason": reason}}
         return {}
     return guard
+
+
+def make_worker_guard(worktree: Path):
+    """Agent SDK PreToolUse hook for unattended workers."""
+    return _make_guard(worktree, "worker")
+
+
+def make_read_guard(root: Path):
+    """PreToolUse hook for read-only agents (planner, reviewer): blocks reading secrets."""
+    return _make_guard(root, "readonly")
 
 
 def hook_main(profile: str, stdin=None) -> int:

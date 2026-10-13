@@ -28,8 +28,8 @@ from .agents import ClaudeRunner
 from .config import CONFIG_TEMPLATE, Config, detect_gates, render_gates
 from .graph import Graph, GraphData, graphify_available
 from .orchestrator import Orchestrator
-from .planning import PlanError, build_tasks, render_plan, save_plan
-from .store import Store, Task
+from .planning import PlanError, build_tasks, plan_fingerprint, render_plan, save_plan
+from .store import RunLocked, Store, Task
 
 
 def _repo(args) -> Path:
@@ -58,6 +58,20 @@ def _graph_data(cfg: Config) -> GraphData | None:
     if not cfg.graph.enabled:
         return None
     return _graph(cfg).data()
+
+
+def _already_queued(store: Store, plan: dict, force: bool) -> bool:
+    """True (and explain) if this exact plan was queued before and --force wasn't given."""
+    if force or plan_fingerprint(plan) not in store.get_meta("approved_plans", []):
+        return False
+    print("This plan was already queued (same tasks). Nothing added; use --force to queue it again.")
+    return True
+
+
+def _queue(store: Store, tasks: list[Task], plan: dict) -> None:
+    for t in tasks:
+        store.add_task(t)
+    store.set_meta("approved_plans", store.get_meta("approved_plans", []) + [plan_fingerprint(plan)])
 
 
 def cmd_init(args) -> None:
@@ -103,14 +117,14 @@ def cmd_plan(args) -> None:
     plan_path = cfg.state_path / "plan.json"
     save_plan(plan_path, args.goal, res.data)
     try:
-        tasks, warnings = build_tasks(res.data, start=len(store.all()) + 1, graph=graph_data)
+        tasks, warnings = build_tasks(res.data, start=len(store.all()) + 1, graph=graph_data,
+                                      existing=store.open_tasks())
     except PlanError as e:
         sys.exit(f"Plan invalid: {e}\nEdit {plan_path} and run `orchestra approve`.")
     print(render_plan(tasks, warnings, res.data))
     print(f"\nPlanner cost ${res.cost_usd:.2f}. Plan saved to {plan_path}")
     if args.approve or (sys.stdin.isatty() and input("\nQueue these tasks? [y/N] ").lower() == "y"):
-        for t in tasks:
-            store.add_task(t)
+        _queue(store, tasks, res.data)
         print(f"Queued {len(tasks)} tasks. Run `orchestra run`.")
     else:
         print("Not queued. Edit the plan if needed, then `orchestra approve`.")
@@ -121,10 +135,12 @@ def cmd_approve(args) -> None:
     store = _store(cfg)
     path = Path(args.plan) if args.plan else cfg.state_path / "plan.json"
     plan = json.loads(path.read_text())
-    tasks, warnings = build_tasks(plan, start=len(store.all()) + 1, graph=_graph_data(cfg))
+    if _already_queued(store, plan, args.force):
+        return
+    tasks, warnings = build_tasks(plan, start=len(store.all()) + 1, graph=_graph_data(cfg),
+                                  existing=store.open_tasks())
     print(render_plan(tasks, warnings, plan))
-    for t in tasks:
-        store.add_task(t)
+    _queue(store, tasks, plan)
     print(f"\nQueued {len(tasks)} tasks.")
 
 
@@ -133,9 +149,11 @@ def cmd_add(args) -> None:
     store = _store(cfg)
     data = json.loads(Path(args.file).read_text())
     items = data if isinstance(data, list) else data.get("tasks", [data])
-    tasks, warnings = build_tasks({"tasks": items}, start=len(store.all()) + 1, graph=_graph_data(cfg))
-    for t in tasks:
-        store.add_task(t)
+    if _already_queued(store, {"tasks": items}, args.force):
+        return
+    tasks, warnings = build_tasks({"tasks": items}, start=len(store.all()) + 1, graph=_graph_data(cfg),
+                                  existing=store.open_tasks())
+    _queue(store, tasks, {"tasks": items})
     for w in warnings:
         print("note:", w)
     print(f"Added {', '.join(t.id for t in tasks)}")
@@ -150,7 +168,12 @@ def cmd_run(args) -> None:
     store = _store(cfg)
     if args.no_wait:
         cfg.limits.wait_for_reset = False
-    if not any(t.status == "pending" for t in store.all()):
+    if live := store.live_lease():
+        print(f"{RunLocked(live)}.\nWatch it with `orchestra status`; only one run works the queue "
+              "at a time.", file=sys.stderr)
+        sys.exit(3)
+    # running/review cards with no live run were interrupted; the run will recover them
+    if not any(t.status in ("pending", "running", "review") for t in store.all()):
         waiting = store.waiting()
         sys.exit(f"Nothing pending; {len(waiting)} card(s) wait for your decision (orchestra decisions)."
                  if waiting else "Nothing pending. Use `orchestra plan` or `orchestra add` first.")
@@ -164,7 +187,12 @@ def cmd_run(args) -> None:
                         asker=TerminalInput() if interactive else None)
     if interactive:
         print("Agents' questions will appear here as they come up.")
-    counts = asyncio.run(orch.run())
+    try:
+        counts = asyncio.run(orch.run())
+    except RunLocked as e:
+        print(f"{e}.\nWatch it with `orchestra status`; only one run works the queue at a time.",
+              file=sys.stderr)
+        sys.exit(3)
     print(f"\nReview the result: git log {cfg.base_branch}..{cfg.integration_branch} "
           f"then open a PR from {cfg.integration_branch}.")
     sys.exit(0 if counts["blocked"] == 0 else 2)
@@ -193,12 +221,21 @@ def cmd_status(args) -> None:
         dep = f" ← {','.join(t.depends_on)}" if t.depends_on else ""
         print(f"{icons.get(t.status, '?')} {t.id} {t.status:9} {t.title[:60]}{dep}  "
               f"(try {t.attempts}, ${t.cost_usd:.2f})")
-    print(f"\n{store.counts()}  total spent ${store.total_cost():.2f} of ${cfg.total_budget_usd:.2f}")
+    last = store.get_meta("last_run") or {}
+    live = store.live_lease()
+    print(f"\n{store.counts()}")
+    print(f"spend: lifetime ${store.total_cost():.2f} · last run ${last.get('spent_usd', 0):.2f} "
+          f"· per-run cap ${cfg.total_budget_usd:.2f}"
+          + (f" · run in progress (pid {live.get('pid')} on {live.get('host')})" if live else ""))
 
 
 def cmd_retry(args) -> None:
     cfg = Config.load(_repo(args))
     store = _store(cfg)
+    t = store.get(args.task)
+    if t.status in ("merged", "running", "review") and not args.force:
+        sys.exit(f"{t.id} is {t.status}; retry is for blocked, cancelled or pending cards "
+                 "(use --force to re-queue it anyway).")
     if args.note:
         store.add_feedback(args.task, f"Guidance from the human lead: {args.note}")
     fields = {"status": "pending", "attempts": 0}
@@ -222,6 +259,9 @@ def cmd_cancel(args) -> None:
     cfg = Config.load(_repo(args))
     store = _store(cfg)
     t = store.get(args.task)
+    if t.status in ("running", "review") and store.live_lease() and not args.force:
+        sys.exit(f"{t.id} is {t.status} in a live run; an agent is working in its worktree. "
+                 "Stop the run first, or use --force.")
     if t.worktree:
         from .gitops import Git
         asyncio.run(Git(cfg.repo, cfg.worktree_root, cfg.base_branch, cfg.integration_branch)
@@ -356,8 +396,12 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("init"); s.add_argument("--force", action="store_true"); s.set_defaults(fn=cmd_init)
     s = sub.add_parser("plan"); s.add_argument("goal"); s.add_argument("--approve", action="store_true")
     s.add_argument("-v", "--verbose", action="store_true"); s.set_defaults(fn=cmd_plan)
-    s = sub.add_parser("approve"); s.add_argument("plan", nargs="?"); s.set_defaults(fn=cmd_approve)
-    s = sub.add_parser("add"); s.add_argument("file"); s.set_defaults(fn=cmd_add)
+    s = sub.add_parser("approve"); s.add_argument("plan", nargs="?")
+    s.add_argument("--force", action="store_true", help="queue even if this plan was queued before")
+    s.set_defaults(fn=cmd_approve)
+    s = sub.add_parser("add"); s.add_argument("file")
+    s.add_argument("--force", action="store_true", help="queue even if these cards were queued before")
+    s.set_defaults(fn=cmd_add)
     s = sub.add_parser("run"); s.add_argument("-j", "--concurrency", type=int)
     s.add_argument("--budget", type=float); s.add_argument("-v", "--verbose", action="store_true")
     s.add_argument("--no-ask", action="store_true",
@@ -368,11 +412,14 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("status"); s.add_argument("task", nargs="?"); s.set_defaults(fn=cmd_status)
     s = sub.add_parser("retry"); s.add_argument("task"); s.add_argument("--note")
     s.add_argument("--model", help="run this card on a specific model, e.g. opus")
+    s.add_argument("--force", action="store_true", help="re-queue even a merged or running card")
     s.set_defaults(fn=cmd_retry)
     s = sub.add_parser("model", help="set the worker model for a queued card")
     s.add_argument("task"); s.add_argument("model", help="alias or full id; 'default' to clear")
     s.set_defaults(fn=cmd_model)
-    s = sub.add_parser("cancel"); s.add_argument("task"); s.set_defaults(fn=cmd_cancel)
+    s = sub.add_parser("cancel"); s.add_argument("task")
+    s.add_argument("--force", action="store_true", help="cancel even while a live run works on it")
+    s.set_defaults(fn=cmd_cancel)
     s = sub.add_parser("decisions", help="list questions agents are waiting on")
     s.set_defaults(fn=cmd_decisions)
     s = sub.add_parser("answer", help="answer an agent's question; it resumes on the next run")

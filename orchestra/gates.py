@@ -7,11 +7,13 @@ goes back to the worker as concrete feedback.
 from __future__ import annotations
 
 import fnmatch
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
-from .config import Config
+from .config import Config, Gate
 from .gitops import DiffStats, run
 
 SECRET_PATTERNS = [
@@ -54,6 +56,8 @@ class GateResult:
 
 async def run_gates(cfg: Config, wt: Path, stats: DiffStats, diff_text: str,
                     scope: list[str]) -> list[GateResult]:
+    """`diff_text` must be the whole diff (not the reviewer's truncated excerpt): the secret
+    scan reads every added line."""
     results: list[GateResult] = []
 
     added_lines = "\n".join(l[1:] for l in diff_text.splitlines()
@@ -64,11 +68,14 @@ async def run_gates(cfg: Config, wt: Path, stats: DiffStats, diff_text: str,
     if secrets:
         return results
 
-    too_big = stats.lines > cfg.max_diff_lines
+    counted = stats.counted(cfg.diff_exclude)
+    skipped = f" (+{stats.lines - counted} in lockfiles/generated files, not counted)" \
+        if counted != stats.lines else ""
+    too_big = counted > cfg.max_diff_lines
     results.append(GateResult(not too_big, "diff_size",
-                              f"{stats.lines} changed lines exceeds limit of {cfg.max_diff_lines}; "
+                              f"{counted} changed lines exceeds limit of {cfg.max_diff_lines}{skipped}; "
                               "do only what the task asks, or report blocked so it can be split"
-                              if too_big else f"{stats.lines} lines"))
+                              if too_big else f"{counted} lines{skipped}"))
     if too_big:
         return results
 
@@ -91,3 +98,64 @@ async def run_gates(cfg: Config, wt: Path, stats: DiffStats, diff_text: str,
 
 def summarize_failures(results: list[GateResult]) -> str:
     return "\n\n".join(f"[gate:{r.name}] FAILED\n{r.detail}" for r in results if not r.passed)
+
+
+# ---------------------------------------------------------------- optional Stop-hook pre-check
+STOP_GATE_REASON = ("Before you finish: these checks fail on your change, and the orchestrator "
+                    "runs them next. Fix them, then give your final report again.\n\n")
+
+
+def find_report(input_data: dict[str, Any], tail_lines: int = 400) -> dict | None:
+    """The worker's structured report for this turn, if we can find it: the Stop input's
+    `last_assistant_message` when it is the JSON report, else the last tool call in the
+    transcript whose input looks like a report (has `status` and `files_changed`)."""
+    msg = input_data.get("last_assistant_message")
+    if isinstance(msg, str):
+        try:
+            data = json.loads(msg)
+        except ValueError:
+            data = None
+        if isinstance(data, dict) and "status" in data:
+            return data
+    path = input_data.get("transcript_path")
+    if not path or not Path(path).exists():
+        return None
+    for line in reversed(Path(path).read_text(errors="replace").splitlines()[-tail_lines:]):
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        content = (entry.get("message") or {}).get("content") if isinstance(entry, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in reversed(content):
+            inp = block.get("input") if isinstance(block, dict) else None
+            if block.get("type") == "tool_use" and isinstance(inp, dict) \
+                    and "status" in inp and "files_changed" in inp:
+                return inp
+    return None
+
+
+def make_stop_gate(gates: list[Gate], worktree: Path, max_blocks: int = 1):
+    """Agent SDK Stop hook: when the worker reports `done`, run the fast gates in its worktree
+    and, if one fails, send it back (at most `max_blocks` times). Never blocks on its own
+    errors, on a non-`done` report, or when it can't find the report."""
+    state = {"blocks": 0}
+
+    async def hook(input_data: dict[str, Any], tool_use_id: str | None, context: Any) -> dict[str, Any]:
+        try:
+            if state["blocks"] >= max_blocks:
+                return {}
+            report = find_report(input_data)
+            if not report or report.get("status") != "done":
+                return {}
+            for g in gates:
+                rc, out = await run(g.cmd, worktree, timeout=g.timeout_s, check=False)
+                if rc != 0:
+                    state["blocks"] += 1
+                    return {"decision": "block",
+                            "reason": STOP_GATE_REASON + f"[gate:{g.name}] `{g.cmd}` exit {rc}\n{out[-2500:]}"}
+            return {}
+        except Exception:  # a broken pre-check must never trap the worker
+            return {}
+    return hook

@@ -1,6 +1,7 @@
 """Turn a planner's raw output into a validated, conflict-free task graph."""
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -11,20 +12,35 @@ class PlanError(ValueError):
     pass
 
 
+GLOB_CHARS = set("*?[")
+
+
+def _literal_base(p: str) -> str:
+    """The path before its first glob segment: 'src/**/*.py' -> 'src', 'src/api/x.py' -> itself."""
+    parts = []
+    for seg in p.strip().strip("/").split("/"):
+        if GLOB_CHARS & set(seg):
+            break
+        parts.append(seg)
+    return "/".join(parts)
+
+
 def _scopes_overlap(a: list[str], b: list[str]) -> bool:
+    """Conservative: entries overlap when their literal bases are equal or nested. A false
+    positive only serializes two cards; a false negative makes them conflict at merge."""
     if not a or not b:
         return True  # unrestricted scope may touch anything
-    def norm(p: str) -> str:
-        p = p.rstrip("/")
-        for suffix in ("/**", "/*", "**", "*"):
-            if p.endswith(suffix):
-                p = p[: -len(suffix)].rstrip("/")
-        return p
-    for x in map(norm, a):
-        for y in map(norm, b):
-            if x == y or x.startswith(y + "/") or y.startswith(x + "/") or not x or not y:
+    for x in map(_literal_base, a):
+        for y in map(_literal_base, b):
+            if not x or not y or x == y or x.startswith(y + "/") or y.startswith(x + "/"):
                 return True
     return False
+
+
+def plan_fingerprint(plan: dict) -> str:
+    """Stable id for a plan's task list, to refuse queueing the same plan twice."""
+    tasks = plan.get("tasks", plan if isinstance(plan, list) else [])
+    return hashlib.sha256(json.dumps(tasks, sort_keys=True).encode()).hexdigest()[:16]
 
 
 def _ancestors(tid: str, deps: dict[str, list[str]], seen: set[str] | None = None) -> set[str]:
@@ -37,9 +53,10 @@ def _ancestors(tid: str, deps: dict[str, list[str]], seen: set[str] | None = Non
 
 
 def build_tasks(plan: dict, id_prefix: str = "T", start: int = 1,
-                graph=None) -> tuple[list[Task], list[str]]:
+                graph=None, existing: list[Task] | None = None) -> tuple[list[Task], list[str]]:
     """Validate the plan, assign stable ids, and serialize tasks whose files overlap
-    (or, with a code graph, whose code calls into each other).
+    (or, with a code graph, whose code calls into each other) — with each other and with
+    `existing` cards still open from earlier plans.
 
     Returns (tasks in topological order, warnings)."""
     raw = plan.get("tasks", [])
@@ -93,6 +110,20 @@ def build_tasks(plan: dict, id_prefix: str = "T", start: int = 1,
             elif graph is not None and (hits := graph.coupled(sa, sb)):
                 deps[b].append(a)
                 warnings.append(f"{b} now waits for {a}: code coupling ({'; '.join(hits[:2])})")
+
+    # Cards already queued or running from earlier plans: new work waits for them. Edges only
+    # point from new to existing cards, so no cycle can form.
+    for b in ids:
+        sb = by_id[b].get("files_scope", [])
+        for e in existing or []:
+            if e.id in deps[b]:
+                continue
+            if _scopes_overlap(e.files_scope, sb):
+                deps[b].append(e.id)
+                warnings.append(f"{b} now waits for {e.id} (already queued): overlapping files_scope")
+            elif graph is not None and (hits := graph.coupled(e.files_scope, sb)):
+                deps[b].append(e.id)
+                warnings.append(f"{b} now waits for {e.id} (already queued): code coupling ({hits[0]})")
 
     tasks = [Task(id=tid, title=by_id[tid]["title"], spec=by_id[tid]["spec"],
                   acceptance=by_id[tid].get("acceptance_criteria", []),

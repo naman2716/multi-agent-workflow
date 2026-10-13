@@ -32,9 +32,10 @@ goal ─► Planner (Opus, read-only) ─► task graph  ──(you approve)─�
 | Silent bad handoffs | Every agent returns schema-validated JSON; handoffs saved in `.orchestra/handoffs/` |
 | Comprehension debt | Diff-size gate (default 600 lines) |
 | Merge races | Serialized merges, rebase + re-gate, compare-and-swap ref update |
-| Runaway cost / time | Per-agent `max_budget_usd` + `max_turns`, global run budget |
-| Dangerous actions | PreToolUse hooks: no writes outside worktree, no git state changes, no secrets, no `rm -rf ..` |
-| Crashes mid-run | State in SQLite; `run` resets interrupted tasks and resumes |
+| Runaway cost / time | Per-agent `max_budget_usd` + `max_turns`, a budget per `orchestra run` |
+| Dangerous actions | OS sandbox for worker shell commands (writes only in the worktree, network only to package registries and GitHub), plus PreToolUse guards: no git state changes, no secrets written or read, no `rm -rf ..` |
+| Reviewer approves its own red flags | An approval with unmet criteria, blocker/major issues or scope creep counts as a rejection |
+| Crashes mid-run | State in SQLite; interrupted cards resume their own session (or resume at review); one live run per repo |
 | `main` getting hit | Work lands on `orchestra/integration`; your checkout is never touched |
 
 ## Setup
@@ -202,15 +203,63 @@ The process must stay alive while it waits. Keep the machine awake
 (macOS: `caffeinate -i orchestra run`), or use `--no-wait` and re-run after the reset.
 If it's interrupted anyway, re-running picks up where it left off.
 
+## Safety: sandbox, guards and the run lease
+
+- **Sandbox (on by default).** Worker shell commands run in Claude Code's OS sandbox (Seatbelt
+  on macOS, bubblewrap on Linux). They can write only inside their worktree, temp and package
+  caches, reach only the hosts in `[sandbox].allowed_domains`, and can't read `~/.ssh`, `~/.aws`
+  and similar. If the sandbox can't start, the worker fails instead of running unsandboxed.
+  `setup_cmd` and gates run outside it, as before. A tool that can't work sandboxed goes in
+  `excluded_commands`; `enabled = false` turns it off.
+- **Guards (second layer).** PreToolUse hooks block git state changes (also after `git -C`/`-c`,
+  and `branch -f`, `config`, `stash`), shell redirects outside the worktree, and reading `.env`
+  or credential files (`.env.example` is fine). Planner and reviewer get the read block too.
+- **No shared memory.** Every agent runs with Claude Code auto memory off, since it is shared
+  by all worktrees of a repo.
+- **One run at a time.** `orchestra run` takes a lease in `.orchestra/state.db`; a second run
+  exits with code 3 and names the holder. A lease with no heartbeat for 60 s (or a dead pid) is
+  taken over. `cancel` on a card a live run is working on, and `retry` on a merged or running
+  card, need `--force`.
+- **Budget.** `total_budget_usd` caps each run; `orchestra status` shows lifetime spend, the
+  last run's spend and the cap.
+
 ## Tuning
 
 - **Gates are the backbone.** Without real tests, the reviewer is all you have. Put fast checks
-  first; set `setup_cmd` (e.g. `npm ci`) so each worktree can run them.
+  first; set `setup_cmd` (e.g. `npm ci`) so each worktree can run them. The worker's card lists
+  every gate command so it runs them before reporting done. Mark cheap gates `fast = true`.
+- **Lockfiles don't count** toward `max_diff_lines` (`[quality].diff_exclude`).
+- **`gates_on_stop` (opt-in).** A Stop hook runs the `fast` gates when the worker reports done
+  and sends it back once with the failures. Enable it after the smoke test below shows it works
+  with your SDK version.
 - **Concurrency 2–4.** Rate limits are pooled across all sessions on your account.
 - **Models:** Opus plans and reviews; Sonnet does `small` tasks, Opus does `large` ones.
 - **Cost:** expect roughly 2–5× a single agent. The live smoke test (1 small task:
   worker + gates + review + merge) cost about $0.18 with Haiku/Sonnet.
-- Exit code is 2 when tasks end blocked, so it can run in CI or on a schedule.
+- Exit code is 2 when tasks end blocked, so it can run in CI or on a schedule; 3 when another
+  run already holds the queue.
+
+### Live smoke test (after upgrading Orchestra or the SDK)
+
+The unit tests use a fake agent, so check the real SDK once on a throwaway repo (~$0.20):
+
+```bash
+mkdir /tmp/smoke && cd /tmp/smoke && git init -q && echo 'def add(a, b): return a + b' > calc.py
+printf 'import unittest\nfrom calc import add\nclass T(unittest.TestCase):\n    def test_add(self): self.assertEqual(add(1, 2), 3)\n' > test_calc.py
+git add -A && git commit -qm init && orchestra init
+# then edit orchestra.toml: profile = "economy", gates_on_stop = true, and add the gate
+#   [[quality.gates]]
+#   name = "test"
+#   cmd = "python -m unittest -q"
+#   fast = true
+echo '[{"key":"mul","title":"Add mul()","spec":"Add mul(a,b) to calc.py with a test","acceptance_criteria":["mul(2,3)==6 tested"],"non_goals":[],"files_scope":["calc.py","test_calc.py"],"depends_on":[],"complexity":"small"}]' > card.json
+orchestra add card.json && orchestra run -v
+```
+
+Expect: the worker's Bash calls succeed inside the sandbox, the card merges, and
+`orchestra status T01` shows no `Worker run failed`. If the run fails with a sandbox or
+structured-output error, set `gates_on_stop = false` (and, if needed, `[sandbox] enabled = false`)
+and tell me the error.
 
 ## Layout
 
@@ -228,8 +277,9 @@ orchestra/
   limits.py        usage-limit tracker (pause/resume) and notifications
   cli.py           init / plan / approve / add / run / status / retry / cancel /
                    graph / stats / harness / hook
-tests/             23 end-to-end tests with scripted fake agents (no API calls);
-                   graph tests run real graphify
+tests/             56 tests with scripted fake agents (no API calls); graph tests run
+                   real graphify and skip without it
+openspec/          specs per module and proposed/archived changes
 ```
 
 Run the tests: `python -m unittest discover -s tests -t . -v`

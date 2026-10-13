@@ -18,7 +18,7 @@ from typing import Any, Callable, Protocol
 from .config import Config
 from .graph import GRAPH_GUIDE, mcp_tool_names
 from .limits import LimitSignal, looks_like_limit
-from .guards import make_worker_guard
+from .guards import make_read_guard, make_worker_guard
 from .store import Task
 
 # ---------------------------------------------------------------- schemas
@@ -130,7 +130,19 @@ You are a worker agent in a multi-agent orchestrator. You own exactly ONE task c
 - If the task is impossible as written (missing access, contradictory requirements),
   report status "blocked" with a precise blocker.
 - Prefer fast, targeted test runs over full suites; don't loop on slow commands.
+- Before reporting "done", run the checks listed on the card and fix what fails; the
+  orchestrator runs exactly those commands next.
 Your final answer must be the structured report."""
+
+SANDBOX_NOTE = """
+Shell commands run in an OS sandbox: you can write only inside this directory, temp and
+package caches, and reach only package registries and GitHub. If a command fails with
+"Operation not permitted" or a network error, don't work around it; finish what you can and
+mention it in your report (or report "blocked" if the task needs it)."""
+
+# The orchestrator's message when gates fail; also used to keep only the latest one on the card.
+GATE_FIX_PREFIX = "Your last change failed automated checks."
+LEGACY_DECISION_PREFIX = "Decision from the lead"
 
 REVIEWER_SYSTEM = """You are an independent code reviewer in a multi-agent system. You did not
 write this code. Judge the diff strictly against the task card.
@@ -153,17 +165,76 @@ def pick_worker_model(cfg: Config, task: Task) -> str:
     return cfg.small_worker_model
 
 
-def task_card(t: Task) -> str:
+def check_verdict(v: dict) -> tuple[bool, list[str]]:
+    """An approval only counts if the reviewer's own findings agree with it."""
+    reasons = []
+    unmet = [c.get("criterion", "?") for c in v.get("criteria", []) if not c.get("met")]
+    if unmet:
+        reasons.append(f"{len(unmet)} acceptance criteria not met")
+    serious = [i for i in v.get("issues", []) if i.get("severity") in ("blocker", "major")]
+    if serious:
+        reasons.append(f"{len(serious)} blocker/major issue(s)")
+    if v.get("scope_creep"):
+        reasons.append("scope creep reported")
+    if v.get("verdict") != "approve":
+        return False, reasons or ["reviewer rejected"]
+    return not reasons, reasons
+
+
+def _card_feedback(feedback: list[str], keep: int = 3, cap: int = 2000) -> list[str]:
+    """Latest notes for the card: only the most recent gate-failure log, then the last few."""
+    gate_idx = [i for i, f in enumerate(feedback) if f.startswith(GATE_FIX_PREFIX)]
+    kept = [f for i, f in enumerate(feedback)
+            if not f.startswith(LEGACY_DECISION_PREFIX)
+            and (not f.startswith(GATE_FIX_PREFIX) or i == gate_idx[-1])]
+    return [f if len(f) <= cap else f[:cap] + "\n... [truncated]" for f in kept[-keep:]]
+
+
+def task_card(t: Task, checks: list[str] | None = None) -> str:
     def bullets(xs: list[str]) -> str:
         return "\n".join(f"- {x}" for x in xs) or "- (none)"
     card = (f"# Task {t.id}: {t.title}\n\n## Spec\n{t.spec}\n\n"
             f"## Acceptance criteria\n{bullets(t.acceptance)}\n\n"
             f"## Non-goals (do NOT do these)\n{bullets(t.non_goals)}\n\n"
             f"## Files you may touch\n{bullets(t.files_scope) if t.files_scope else '- (unrestricted)'}\n")
-    if t.feedback:
+    decisions = [f"- Q: {d.get('question', '')}\n  A: {d.get('answer', '')}" for d in t.decisions]
+    decisions += [f"- {f[len(LEGACY_DECISION_PREFIX):].lstrip(' —-:')}" for f in t.feedback
+                  if f.startswith(LEGACY_DECISION_PREFIX)]  # answers stored by older versions
+    if decisions:
+        card += "\n## Decisions already made (binding; do not ask again)\n" + "\n".join(decisions) + "\n"
+    if checks:
+        card += ("\n## Checks the orchestrator will run (run them before reporting done)\n"
+                 + "\n".join(f"- `{c}`" for c in checks) + "\n")
+    notes = _card_feedback(t.feedback)
+    if notes:
         card += ("\n## Feedback from previous attempts (address all of it)\n" +
-                 "\n\n".join(f"### Attempt note {i+1}\n{f}" for i, f in enumerate(t.feedback[-3:])))
+                 "\n\n".join(f"### Attempt note {i+1}\n{f}" for i, f in enumerate(notes)))
     return card
+
+
+def agent_env() -> dict[str, str]:
+    """Environment for every agent session. Auto memory is per repository and shared by all
+    worktrees, so parallel agents (and your own sessions) would read each other's notes."""
+    return {"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}
+
+
+def sandbox_settings(cfg: Config) -> dict | None:
+    """Claude Code sandbox settings for worker Bash commands, or None when disabled.
+    The SDK merges this dict into --settings verbatim, so CLI keys missing from its
+    SandboxSettings type (failIfUnavailable, filesystem) still apply."""
+    s = cfg.sandbox
+    if not s.enabled:
+        return None
+    return {
+        "enabled": True,
+        "autoAllowBashIfSandboxed": True,
+        "allowUnsandboxedCommands": False,   # no dangerouslyDisableSandbox escape hatch
+        "failIfUnavailable": True,           # never fall back to running unsandboxed
+        "excludedCommands": list(s.excluded_commands),
+        "network": {"allowedDomains": list(s.allowed_domains),
+                    "allowLocalBinding": bool(s.allow_local_binding)},
+        "filesystem": {"allowWrite": list(s.allow_write), "denyRead": list(s.deny_read)},
+    }
 
 
 # ---------------------------------------------------------------- results
@@ -270,12 +341,15 @@ class ClaudeRunner:
         from claude_agent_sdk import ClaudeAgentOptions
         base = ["Read", "Glob", "Grep"]
         servers, allowed, guide = _graph_opts(cfg, graph, base)
+        from claude_agent_sdk import HookMatcher
+        root = cwd or cfg.repo
         opts = ClaudeAgentOptions(
-            cwd=str(cwd or cfg.repo), model=cfg.planner_model,
+            cwd=str(root), model=cfg.planner_model,
             system_prompt=PLANNER_SYSTEM + guide + _context(cfg),
             tools=base, allowed_tools=allowed, mcp_servers=servers, strict_mcp_config=True,
             setting_sources=["project"], max_turns=60, session_id=_new_session(),
-            max_budget_usd=cfg.task_budget_usd * 2,
+            max_budget_usd=cfg.task_budget_usd * 2, env=agent_env(),
+            hooks={"PreToolUse": [HookMatcher(hooks=[make_read_guard(Path(root))])]},
             output_format={"type": "json_schema", "schema": PLAN_SCHEMA},
         )
         return await self._run(f"Goal:\n{goal}\n\nExplore the repository, then produce the plan.",
@@ -286,29 +360,37 @@ class ClaudeRunner:
         """Run the worker. With `resume` (and a stored session), continue that session
         with the given message instead of starting cold: the agent keeps its context."""
         from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
+        from .gates import make_stop_gate
         tools = ["Read", "Write", "Edit", "Glob", "Grep", "Bash"]
         servers, allowed, guide = _graph_opts(cfg, graph, tools)
+        sandbox = sandbox_settings(cfg)
+        hooks = {"PreToolUse": [HookMatcher(hooks=[make_worker_guard(worktree)])]}
+        fast = [g for g in cfg.gates if g.fast]
+        if cfg.gates_on_stop and fast:
+            hooks["Stop"] = [HookMatcher(hooks=[make_stop_gate(fast, worktree)],
+                                         timeout=sum(g.timeout_s for g in fast) + 30)]
         opts = ClaudeAgentOptions(
             cwd=str(worktree),
             model=pick_worker_model(cfg, task),
             system_prompt={"type": "preset", "preset": "claude_code",
-                           "append": WORKER_APPEND + guide + _context(cfg)},
+                           "append": WORKER_APPEND + (SANDBOX_NOTE if sandbox else "")
+                           + guide + _context(cfg)},
             tools=tools, allowed_tools=allowed, permission_mode="acceptEdits",
             mcp_servers=servers, strict_mcp_config=True,
             setting_sources=["project"],  # picks up the repo's CLAUDE.md
             max_turns=cfg.worker_max_turns, max_budget_usd=cfg.task_budget_usd,
-            hooks={"PreToolUse": [HookMatcher(hooks=[make_worker_guard(worktree)])]},
+            env=agent_env(), sandbox=sandbox, hooks=hooks,
             output_format={"type": "json_schema", "schema": WORK_SCHEMA},
             resume=task.session_id if (resume and task.session_id) else None,
             session_id=None if (resume and task.session_id) else _new_session(),
         )
-        prompt = resume if (resume and task.session_id) else task_card(task)
+        prompt = resume if (resume and task.session_id) else task_card(task, gate_commands(cfg))
         return await self._run(prompt, opts, task.id)
 
     async def review(self, cfg: Config, task: Task, worktree: Path, diff: str,
                      work_report: dict[str, Any], gate_log: str, impact: str = "",
                      graph: Path | None = None) -> AgentResult:
-        from claude_agent_sdk import ClaudeAgentOptions
+        from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
         impact_block = (f"## Impact (from the code graph: code outside this diff that depends on "
                         f"changed symbols; check these still work)\n{impact}\n\n" if impact else "")
         prompt = (f"{task_card(task)}\n\n## Worker's report\n```json\n{json.dumps(work_report, indent=2)}\n```\n\n"
@@ -321,10 +403,15 @@ class ClaudeRunner:
             system_prompt=REVIEWER_SYSTEM + guide + _context(cfg),
             tools=base, allowed_tools=allowed, mcp_servers=servers, strict_mcp_config=True,
             setting_sources=["project"], max_turns=40, max_budget_usd=cfg.task_budget_usd,
-            session_id=_new_session(),
+            session_id=_new_session(), env=agent_env(),
+            hooks={"PreToolUse": [HookMatcher(hooks=[make_read_guard(worktree)])]},
             output_format={"type": "json_schema", "schema": REVIEW_SCHEMA},
         )
         return await self._run(prompt, opts, f"{task.id}:review")
+
+
+def gate_commands(cfg: Config) -> list[str]:
+    return [g.cmd for g in cfg.gates]
 
 
 def _new_session() -> str:
