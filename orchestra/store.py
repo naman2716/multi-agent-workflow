@@ -15,9 +15,12 @@ Task lifecycle:
 from __future__ import annotations
 
 import json
+import os
+import socket
 import sqlite3
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -61,10 +64,43 @@ MIGRATIONS = [  # columns added after v0.1; applied idempotently
     ("base_commit", "TEXT"),     # integration head the worktree was cut from
     ("resume_note", "TEXT"),     # message to send when resuming that session
     ("decision", "TEXT"),        # JSON: the open (or answered) question for the human
+    ("decisions", "TEXT NOT NULL DEFAULT '[]'"),  # JSON: every answered question, kept on the card
 ]
 
-JSON_FIELDS = ("acceptance", "non_goals", "files_scope", "depends_on", "feedback")
+JSON_FIELDS = ("acceptance", "non_goals", "files_scope", "depends_on", "feedback", "decisions")
 STATUSES = ("pending", "running", "review", "waiting", "merged", "blocked", "cancelled")
+OPEN_STATUSES = ("pending", "running", "review", "waiting")
+LEASE_TTL_S = 60  # a run lease with no heartbeat for this long is stale
+
+
+class RunLocked(RuntimeError):
+    """Another live `orchestra run` holds this repository's queue."""
+
+    def __init__(self, holder: dict):
+        self.holder = holder
+        super().__init__(f"another orchestra run is active (pid {holder.get('pid')} on "
+                         f"{holder.get('host')}, started {time.strftime('%H:%M', time.localtime(holder.get('started', 0)))})")
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def lease_is_live(lease: dict | None, now: float | None = None, ttl: float = LEASE_TTL_S) -> bool:
+    if not lease:
+        return False
+    now = time.time() if now is None else now
+    if now - float(lease.get("heartbeat", 0)) > ttl:
+        return False
+    if lease.get("host") == socket.gethostname() and not _pid_alive(int(lease.get("pid", 0))):
+        return False
+    return True
 
 
 @dataclass
@@ -82,6 +118,7 @@ class Task:
     base_commit: str | None = None
     resume_note: str | None = None
     decision: dict | None = None
+    decisions: list[dict] = field(default_factory=list)  # answered questions: question, answer, at
     status: str = "pending"
     attempts: int = 0
     feedback: list[str] = field(default_factory=list)
@@ -186,17 +223,49 @@ class Store:
             self.conn.execute("UPDATE tasks SET cost_usd=cost_usd+?, tokens=tokens+? WHERE id=?",
                               (usd or 0.0, tokens or 0, task_id))
 
-    def recover_stale(self) -> list[str]:
-        """After a crash, tasks left 'running'/'review' go back to pending."""
+    def interrupted(self) -> list[Task]:
+        """Tasks a previous run left 'running'/'review' (it crashed or was stopped)."""
+        return [t for t in self.all() if t.status in ("running", "review")]
+
+    # ---------- run lease: one live `orchestra run` per repository ----------
+    def acquire_lease(self, ttl: float = LEASE_TTL_S) -> str:
+        """Take the run lease or raise RunLocked. Atomic across processes."""
+        now = time.time()
+        me = {"token": uuid.uuid4().hex, "pid": os.getpid(), "host": socket.gethostname(),
+              "started": now, "heartbeat": now}
         with self._lock:
-            ids = [r[0] for r in self.conn.execute(
-                "SELECT id FROM tasks WHERE status IN ('running','review')")]
-            self.conn.execute(
-                "UPDATE tasks SET status='pending', attempts=MAX(attempts-1,0), session_id=NULL, "
-                "resume_note=NULL, worktree=NULL WHERE status IN ('running','review')")
-        for i in ids:
-            self.log(i, "recovered", "reset to pending after interrupted run")
-        return ids
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self.conn.execute("SELECT value FROM meta WHERE key='run_lease'").fetchone()
+                current = json.loads(row[0]) if row else None
+                if lease_is_live(current, now, ttl):
+                    raise RunLocked(current)
+                self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('run_lease', ?)", (json.dumps(me),))
+                self.conn.execute("COMMIT")
+            except BaseException:
+                self.conn.execute("ROLLBACK")
+                raise
+        return me["token"]
+
+    def heartbeat(self, token: str) -> bool:
+        """Refresh our lease; False if it was taken over (or released)."""
+        with self._lock:
+            lease = self.get_meta("run_lease")
+            if not lease or lease.get("token") != token:
+                return False
+            lease["heartbeat"] = time.time()
+            self.set_meta("run_lease", lease)
+            return True
+
+    def release_lease(self, token: str) -> None:
+        with self._lock:
+            lease = self.get_meta("run_lease")
+            if lease and lease.get("token") == token:
+                self.conn.execute("DELETE FROM meta WHERE key='run_lease'")
+
+    def live_lease(self) -> dict | None:
+        lease = self.get_meta("run_lease")
+        return lease if lease_is_live(lease) else None
 
     def log(self, task_id: str | None, kind: str, detail: str = "") -> None:
         with self._lock:
@@ -256,14 +325,20 @@ class Store:
         if t.status != "waiting" or not t.decision:
             raise ValueError(f"{task_id} is not waiting for a decision (status: {t.status})")
         q = t.decision.get("question", "")
-        decision = {**t.decision, "answer": answer, "answered_at": time.time()}
+        now = time.time()
+        decision = {**t.decision, "answer": answer, "answered_at": now}
         note = (f"The lead answered your question.\nQuestion: {q}\nAnswer: {answer}\n"
                 "Continue the task from where you stopped, applying this decision.")
-        self.update(task_id, status="pending", decision=decision, resume_note=note,
-                    attempts=max(t.attempts - 1, 0))  # asking is not a failed attempt
-        self.add_feedback(task_id, f"Decision from the lead — Q: {q} A: {answer}")
+        # Decisions live in their own list so every later attempt's card shows them.
+        decisions = t.decisions + [{"question": q, "answer": answer, "at": now}]
+        self.update(task_id, status="pending", decision=decision, decisions=decisions,
+                    resume_note=note, attempts=max(t.attempts - 1, 0))  # asking is not a failed attempt
         self.log(task_id, "answered", answer)
         return self.get(task_id)
+
+    def open_tasks(self) -> list[Task]:
+        """Cards still in flight: pending, running, in review, or waiting on the human."""
+        return [t for t in self.all() if t.status in OPEN_STATUSES]
 
     def unrunnable(self) -> list[Task]:
         """Pending tasks that can never run because a dependency is blocked/cancelled/missing."""

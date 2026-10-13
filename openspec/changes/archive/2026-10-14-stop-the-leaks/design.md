@@ -12,6 +12,8 @@
 - `task_card()` renders every decision under `## Decisions already made (binding)`.
 - Feedback rendering keeps only the most recent gate-failure note (prefix match on the
   orchestrator's own fix message), then the last 3 notes, each capped at 2,000 chars.
+  (As built: the "still failing after 2 rounds" attempt note uses the same prefix, so it
+  replaces the fix notes instead of repeating the same log.)
 
 ## 3. Verdict cross-check (orchestration)
 - `agents.check_verdict(v) -> (approved, reasons)`: approved only if `verdict == "approve"`,
@@ -23,6 +25,8 @@
   `[quality].diff_exclude` (default: common lockfiles plus `go.sum`).
 - Gates get the full `git diff` (no char limit) for the secret scan; the reviewer still gets the
   60k excerpt.
+- (As built) the reviewer's gate log and the "gates passed" event include passing details, e.g.
+  `12 lines (+700 in lockfiles/generated files, not counted)`.
 
 ## 5. Plans (planning, cli)
 - `plan_fingerprint(plan)` = sha256 of the canonical JSON of its tasks. Approved fingerprints
@@ -47,6 +51,9 @@
   and releases in `finally`.
 - `cancel` refuses a running/review card while a live lease exists; `retry` refuses merged,
   running and review cards; `--force` overrides both.
+- (As built) `orchestra run` checks for a live lease before anything else, so the message is
+  "another run is active" rather than "nothing pending". `run` also treats running/review
+  cards as resumable work when no live lease exists.
 
 ## 8. Resumable recovery (orchestration)
 - `Store.interrupted()` lists running/review cards. For each: if worktree, session and base
@@ -54,6 +61,8 @@
   (when it was in review and the saved report exists) or `INTERRUPTED_NOTE`. Otherwise reset
   and remove the worktree as today.
 - `_execute`: `REVIEW_STAGE` with no saved report resumes the worker with `INTERRUPTED_NOTE`.
+- (As built) the interrupted note restates answered decisions, in case the session was cut
+  off before it received the latest answer.
 
 ## 9. Sandbox and isolation (safety, agents, cli)
 - New `[sandbox]` config: `enabled` (true), `allowed_domains`, `allow_write`, `deny_read`,
@@ -69,6 +78,12 @@
 - Every role gets `env={"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}`; planner and reviewer also
   get a read guard hook.
 - `setup_cmd` and gates run in the orchestrator process, outside the sandbox, as today.
+- (As built) `allow_local_binding` (default true) maps to `network.allowLocalBinding`: on macOS,
+  sandboxed commands otherwise can't listen on ports or reach localhost services, which breaks
+  most backend test suites. Trade-off: anything on localhost is reachable while it's on.
+- Note from the sandbox docs: in a linked worktree the sandbox still lets git write refs in the
+  shared `.git` (only `hooks/` and `config` are protected), so the guard's `branch -f` /
+  `update-ref` blocks remain necessary.
 - Guard (second layer): git subcommands detected after global options (`git -C x`, `git -c k=v`);
   adds `branch -f/-m/-M`, `config`, `stash`, `symbolic-ref`; blocks redirects (`>`, `>>`, `tee`)
   to absolute or `..` paths outside the worktree except `/dev/null`, `/tmp`, `$TMPDIR`; blocks

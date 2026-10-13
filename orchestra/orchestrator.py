@@ -13,7 +13,9 @@ Attempts exhausted or worker reports "blocked" -> task goes to `blocked` for a h
 Worker asks a question ("needs_decision") -> task goes to `waiting` with its worktree and
 session kept; after `orchestra answer`, the same session resumes with the answer.
 Usage limit hit -> dispatch pauses until the reset; cut-off agents resume their sessions.
-A global budget stops new dispatches once spent.
+A per-run budget stops new dispatches once this run has spent it.
+Only one run works a repository's queue at a time (a heartbeat lease in the store); after a
+crash, cards with their worktree and session intact resume where they stopped.
 """
 from __future__ import annotations
 
@@ -23,7 +25,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from .agents import Runner, pick_worker_model
+from .agents import GATE_FIX_PREFIX, Runner, check_verdict, pick_worker_model
 from .config import Config
 from .gates import run_gates, summarize_failures
 from .asking import LineSource, parse_answer, render_question
@@ -36,6 +38,9 @@ FIX_ROUNDS = 2  # gate-failure fix loops inside one attempt, before starting fre
 REVIEW_STAGE = "__resume_at_review__"  # resume marker: worker done, only review was cut off
 LIMIT_NOTE = ("You were paused by a usage limit. Continue the task from exactly where you "
               "stopped; your earlier edits are still in the worktree.")
+INTERRUPTED_NOTE = ("The orchestrator was interrupted while you worked. Your edits so far are "
+                    "still in the worktree; check where you were and finish the task.")
+HEARTBEAT_S = 15.0
 
 
 class Orchestrator:
@@ -125,10 +130,49 @@ class Orchestrator:
 
     # ------------------------------------------------------------ main loop
     async def run(self) -> dict[str, int]:
+        """Work the queue. Raises store.RunLocked if another live run holds this repo."""
+        token = self.store.acquire_lease()
+        beat = asyncio.create_task(self._heartbeat(token))
+        try:
+            return await self._run()
+        finally:
+            beat.cancel()
+            self.store.release_lease(token)
+
+    async def _heartbeat(self, token: str) -> None:
+        while True:
+            await asyncio.sleep(HEARTBEAT_S)
+            try:
+                if not self.store.heartbeat(token):
+                    self.say(None, "run lease was taken over by another process", "warn")
+            except Exception as e:  # never let bookkeeping kill the run
+                self.say(None, f"lease heartbeat failed: {e!r}", "warn")
+
+    def run_spent(self) -> float:
+        return self.store.total_cost() - self._start_cost
+
+    async def _recover(self) -> None:
+        """Cards a previous run left running/in review: resume them where possible."""
+        for t in self.store.interrupted():
+            intact = bool(t.worktree and Path(t.worktree).exists() and t.session_id and t.base_commit)
+            if intact:
+                at_review = t.status == "review" and self._report_path(t).exists()
+                self.store.update(t.id, status="pending", attempts=max(t.attempts - 1, 0),
+                                  resume_note=REVIEW_STAGE if at_review else _interrupted_note(t))
+                self.say(t.id, "recovered from interrupted run → will resume "
+                         + ("at review" if at_review else "its session"))
+            else:
+                self.store.update(t.id, status="pending", attempts=max(t.attempts - 1, 0),
+                                  session_id=None, resume_note=None, worktree=None)
+                await self.git.remove_worktree(t.id, f"orchestra/task/{t.id}")
+                self.say(t.id, "recovered from interrupted run → pending")
+            self.store.log(t.id, "recovered", "resumable" if intact else "restarted")
+
+    async def _run(self) -> dict[str, int]:
+        self._start_cost = self.store.total_cost()
+        started = time.time()
         await self.git.ensure_integration_branch()
-        for tid in self.store.recover_stale():
-            await self.git.remove_worktree(tid, f"orchestra/task/{tid}")
-            self.say(tid, "recovered from interrupted run → pending")
+        await self._recover()
         if self.cfg.graph.enabled:
             await self.graph.refresh()
 
@@ -139,8 +183,8 @@ class Orchestrator:
         while True:
             self._schedule_prompts()
             self._cancel_stale_prompts()
-            if self.store.total_cost() >= self.cfg.total_budget_usd and not self.stop_reason:
-                self.stop_reason = f"budget ${self.cfg.total_budget_usd:.2f} reached"
+            if self.run_spent() >= self.cfg.total_budget_usd and not self.stop_reason:
+                self.stop_reason = f"run budget ${self.cfg.total_budget_usd:.2f} reached"
                 self.say(None, f"{self.stop_reason}; finishing in-flight tasks, no new dispatch")
 
             if self.limits.gave_up() and not self.stop_reason:
@@ -193,7 +237,12 @@ class Orchestrator:
         for t in waiting:
             self.say(t.id, f"waiting for your decision: {t.decision.get('question', '')[:200]}", "decision")
         counts = self.store.counts()
-        self.say(None, f"run finished: {counts} · spent ${self.store.total_cost():.2f}"
+        spent = self.run_spent()
+        self.store.set_meta("last_run", {"started_at": started, "finished_at": time.time(),
+                                         "spent_usd": round(spent, 4), "counts": counts,
+                                         "stop_reason": self.stop_reason})
+        self.say(None, f"run finished: {counts} · this run ${spent:.2f} "
+                 f"(lifetime ${self.store.total_cost():.2f})"
                  + (f" · stopped: {self.stop_reason}" if self.stop_reason else ""))
         for fut in self.prompts:
             fut.cancel()
@@ -231,8 +280,10 @@ class Orchestrator:
         if resuming and note == REVIEW_STAGE and (saved := self._load_report(task)):
             report, gate_log = saved
         else:
-            outcome = await self._work_until_green(task, wt, base, graph,
-                                                   resume=note if resuming else None)
+            # REVIEW_STAGE is an internal marker: without a saved report, resume the worker
+            # with a plain explanation instead of sending the marker as its message.
+            message = (_interrupted_note(task) if note == REVIEW_STAGE else note) if resuming else None
+            outcome = await self._work_until_green(task, wt, base, graph, resume=message)
             if outcome is None:
                 return  # already handled: failed, blocked, waiting, or paused
             report, gate_log = outcome
@@ -253,9 +304,15 @@ class Orchestrator:
             return await self._fail_attempt(task, f"Reviewer run failed: {rev.error}")
         verdict = rev.data
         self._write_handoff(task, report, verdict, base)
-        if verdict.get("verdict") != "approve":
-            self.say(task.id, "review rejected", "review")
-            return await self._fail_attempt(task, _review_feedback(verdict))
+        approved, reasons = check_verdict(verdict)
+        if not approved:
+            overridden = verdict.get("verdict") == "approve"
+            if overridden:
+                self.say(task.id, "reviewer approved but reported "
+                         + "; ".join(reasons) + " → treated as a rejection", "review-override")
+            else:
+                self.say(task.id, "review rejected", "review")
+            return await self._fail_attempt(task, _review_feedback(verdict, reasons if overridden else None))
         self.say(task.id, "review approved", "review")
         await self._integrate(task, wt, report)
 
@@ -296,21 +353,25 @@ class Orchestrator:
             if not stats.files:
                 await self._fail_attempt(task, "Worker reported done but changed no files.")
                 return None
-            diff = await self.git.diff_text(wt, base)
+            diff = await self.git.diff_text(wt, base, limit_chars=None)  # whole diff for the secret scan
             results = await run_gates(cfg, wt, stats, diff, task.files_scope)
             await self.git.discard_uncommitted(wt)
-            gate_log = "\n".join(f"- {r.name}: {'pass' if r.passed else 'FAIL'}" for r in results)
+            gate_log = "\n".join(f"- {r.name}: {'pass' if r.passed else 'FAIL'}"
+                                 + (f" ({r.detail})" if r.passed and r.detail else "") for r in results)
             if all(r.passed for r in results):
-                self.say(task.id, f"gates passed ({stats.lines} lines, {len(stats.files)} files)")
+                size = next((r.detail for r in results if r.name == "diff_size"), f"{stats.lines} lines")
+                self.say(task.id, f"gates passed ({size}, {len(stats.files)} files)")
                 return report, gate_log
             failures = summarize_failures(results)
             self.say(task.id, f"gates failed (round {round_no + 1}): "
                      f"{', '.join(r.name for r in results if not r.passed)}", "gate")
             if round_no >= FIX_ROUNDS:
-                await self._fail_attempt(task, f"Quality gates still failing:\n{failures}")
+                # same prefix as the fix notes, so the card keeps only this latest gate log
+                await self._fail_attempt(task, f"{GATE_FIX_PREFIX} Still failing after {FIX_ROUNDS} "
+                                         f"fix rounds, so the attempt was restarted:\n{failures}")
                 return None
             round_no += 1
-            fix = f"Your last change failed automated checks. Fix these, keep the diff focused:\n{failures}"
+            fix = f"{GATE_FIX_PREFIX} Fix these, keep the diff focused:\n{failures}"
             self.store.add_feedback(task.id, fix)
             # with a live session, send just the failures (agent keeps its context: fewer tokens)
             message = fix if self.store.get(task.id).session_id else None
@@ -326,7 +387,7 @@ class Orchestrator:
                     f"Redo it on top of the latest code.\n{out[-1500:]}")
             if base_before != old:  # base moved: re-verify against the combined code
                 stats = await self.git.diff_stats(wt, old)
-                diff = await self.git.diff_text(wt, old)
+                diff = await self.git.diff_text(wt, old, limit_chars=None)
                 results = await run_gates(self.cfg, wt, stats, diff, task.files_scope)
                 await self.git.discard_uncommitted(wt)
                 if not all(r.passed for r in results):
@@ -404,8 +465,20 @@ class Orchestrator:
             "work_report": report, "review": verdict}, indent=2))
 
 
-def _review_feedback(v: dict) -> str:
+def _interrupted_note(t: Task) -> str:
+    """Resume message after an interruption. Restates answered decisions, in case the
+    session was cut off before it received the latest answer."""
+    if not t.decisions:
+        return INTERRUPTED_NOTE
+    return INTERRUPTED_NOTE + "\nDecisions already made (binding):\n" + "\n".join(
+        f"- Q: {d.get('question', '')} A: {d.get('answer', '')}" for d in t.decisions)
+
+
+def _review_feedback(v: dict, override_reasons: list[str] | None = None) -> str:
     parts = ["Reviewer rejected the previous attempt."]
+    if override_reasons:
+        parts = ["The reviewer marked the previous attempt as approved, but its own findings "
+                 f"({'; '.join(override_reasons)}) mean it can't be merged. Address them."]
     unmet = [c for c in v.get("criteria", []) if not c.get("met")]
     if unmet:
         parts.append("Unmet criteria:\n" + "\n".join(f"- {c['criterion']}: {c['evidence']}" for c in unmet))

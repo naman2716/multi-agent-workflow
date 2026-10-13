@@ -14,6 +14,41 @@ class Gate:
     name: str
     cmd: str
     timeout_s: int = 900
+    fast: bool = False  # cheap check (lint, typecheck); used by the optional Stop-hook pre-check
+
+
+FAST_GATE_NAMES = ("lint", "typecheck", "type-check", "analyze", "vet", "format")
+
+# Changed lines in these files don't count toward max_diff_lines.
+DEFAULT_DIFF_EXCLUDE = ["*.lock", "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml",
+                        "yarn.lock", "pubspec.lock", "go.sum", "poetry.lock", "uv.lock", "Cargo.lock"]
+
+# Worker shell sandbox defaults: package registries and GitHub only.
+DEFAULT_ALLOWED_DOMAINS = [
+    "registry.npmjs.org", "registry.yarnpkg.com",           # npm / yarn
+    "pypi.org", "files.pythonhosted.org",                    # pip
+    "pub.dev",                                               # dart / flutter
+    "proxy.golang.org", "sum.golang.org",                    # go modules
+    "github.com", "api.github.com", "codeload.github.com",
+    "objects.githubusercontent.com", "raw.githubusercontent.com",
+]
+DEFAULT_ALLOW_WRITE = ["~/.npm", "~/.cache", "~/Library/Caches", "~/.pnpm-store", "~/Library/pnpm",
+                       "~/.yarn", "~/.pub-cache", "~/go/pkg/mod"]
+DEFAULT_DENY_READ = ["~/.ssh", "~/.aws", "~/.config/gcloud", "~/.gnupg", "~/.netrc",
+                     "~/.docker/config.json"]
+
+
+@dataclass
+class Sandbox:
+    """OS sandbox for worker Bash commands (Seatbelt on macOS, bubblewrap on Linux)."""
+    enabled: bool = True
+    allowed_domains: list[str] = field(default_factory=lambda: list(DEFAULT_ALLOWED_DOMAINS))
+    allow_write: list[str] = field(default_factory=lambda: list(DEFAULT_ALLOW_WRITE))
+    deny_read: list[str] = field(default_factory=lambda: list(DEFAULT_DENY_READ))
+    excluded_commands: list[str] = field(default_factory=list)  # run outside the sandbox
+    # macOS: let sandboxed commands listen on ports and reach localhost services (test
+    # servers, a local database). Without it most backend test suites fail inside the sandbox.
+    allow_local_binding: bool = True
 
 
 MODEL_PROFILES = {
@@ -57,9 +92,12 @@ class Config:
     escalate_on_retry: bool = True  # retry a failed small card on the large-worker model
 
     max_diff_lines: int = 600
+    diff_exclude: list[str] = field(default_factory=lambda: list(DEFAULT_DIFF_EXCLUDE))
     enforce_file_scope: bool = True
     setup_cmd: str = ""  # run once in each new worktree, e.g. "npm ci"
     gates: list[Gate] = field(default_factory=list)
+    gates_on_stop: bool = False  # Stop hook runs fast gates before a worker may finish (opt-in)
+    sandbox: Sandbox = field(default_factory=Sandbox)
     project_context: str = ""  # extra conventions every agent should know
     graph: GraphSettings = field(default_factory=GraphSettings)
     limits: Limits = field(default_factory=Limits)
@@ -89,6 +127,7 @@ class Config:
         gates = [Gate(**g) for g in q.get("gates", [])]
         gr = data.get("graph", {})
         lim = data.get("limits", {})
+        sb = data.get("sandbox", {})
         profile = m.get("profile", DEFAULT_PROFILE)
         if profile not in MODEL_PROFILES:
             raise ValueError(f"unknown model profile {profile!r}; use one of {list(MODEL_PROFILES)}")
@@ -111,9 +150,12 @@ class Config:
             large_worker_model=pm["large_worker"],
             escalate_on_retry=m.get("escalate_on_retry", True),
             max_diff_lines=q.get("max_diff_lines", 600),
+            diff_exclude=q.get("diff_exclude", list(DEFAULT_DIFF_EXCLUDE)),
             enforce_file_scope=q.get("enforce_file_scope", True),
             setup_cmd=q.get("setup_cmd", ""),
             gates=gates,
+            gates_on_stop=q.get("gates_on_stop", False),
+            sandbox=Sandbox(**{k: v for k, v in sb.items() if k in Sandbox.__dataclass_fields__}),
             project_context=data.get("project", {}).get("context", ""),
             graph=GraphSettings(enabled=gr.get("enabled", False), python=gr.get("python", ""),
                                 refresh_timeout_s=gr.get("refresh_timeout_s", 900)),
@@ -150,6 +192,8 @@ def detect_gates(repo: Path) -> tuple[str, list[Gate]]:
         gates += [Gate("lint", "ruff check ."), Gate("test", "python -m pytest -q")]
     if (repo / "go.mod").exists():
         gates += [Gate("vet", "go vet ./..."), Gate("test", "go test ./...")]
+    for g in gates:
+        g.fast = g.name in FAST_GATE_NAMES
     return setup, gates
 
 
@@ -160,7 +204,7 @@ base_branch = "{base}"
 integration_branch = "orchestra/integration"
 concurrency = 3            # parallel workers (rate limits are pooled across sessions)
 max_attempts = 3           # per task, before escalating to a human
-total_budget_usd = 25.0    # hard stop for the whole run
+total_budget_usd = 25.0    # spending cap for each `orchestra run` (lifetime spend is shown in status)
 task_budget_usd = 4.0      # per agent call
 worker_max_turns = 80
 ask_in_terminal = true     # agents' questions pop up in the terminal during `orchestra run`
@@ -196,9 +240,27 @@ command = ""
 
 [quality]
 max_diff_lines = 600       # reject oversized diffs (comprehension debt)
+# files whose changed lines don't count toward max_diff_lines (lockfiles, generated code)
+diff_exclude = ["*.lock", "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "pubspec.lock", "go.sum", "poetry.lock", "uv.lock", "Cargo.lock"]
 enforce_file_scope = true  # reject edits outside a task's declared files
 setup_cmd = "{setup}"      # runs once in each new worktree
+# Opt-in: a Stop hook runs the `fast` gates before a worker may report done, and sends it
+# back once with the failures. Turn on after one live smoke run (see README).
+gates_on_stop = false
 {gates}
+[sandbox]
+# Worker shell commands run in Claude Code's OS sandbox (Seatbelt on macOS): writes only in
+# the worktree, temp and the caches below; network only to these hosts. setup_cmd and gates
+# run outside the sandbox. Set enabled = false to turn it off.
+enabled = true
+allowed_domains = ["registry.npmjs.org", "registry.yarnpkg.com", "pypi.org", "files.pythonhosted.org", "pub.dev", "proxy.golang.org", "sum.golang.org", "github.com", "api.github.com", "codeload.github.com", "objects.githubusercontent.com", "raw.githubusercontent.com"]
+allow_write = ["~/.npm", "~/.cache", "~/Library/Caches", "~/.pnpm-store", "~/Library/pnpm", "~/.yarn", "~/.pub-cache", "~/go/pkg/mod"]
+deny_read = ["~/.ssh", "~/.aws", "~/.config/gcloud", "~/.gnupg", "~/.netrc", "~/.docker/config.json"]
+excluded_commands = []     # e.g. ["flutter"] to run a tool outside the sandbox
+# macOS: allow listening on ports and reaching localhost services (test servers, local DB).
+# Turn off if your tests need neither; anything on your localhost is reachable while on.
+allow_local_binding = true
+
 [graph]
 # Graphify code knowledge graph (pip install "graphifyy[mcp]"). Local tree-sitter parsing,
 # no LLM tokens. Refreshed after every merge; agents query it via MCP instead of reading files.
@@ -218,4 +280,5 @@ def render_gates(gates: list[Gate]) -> str:
     if not gates:
         return ('# Add your checks. Fastest first. Exit code 0 = pass.\n'
                 '# [[quality.gates]]\n# name = "test"\n# cmd = "npm test"\n')
-    return "".join(f'[[quality.gates]]\nname = "{g.name}"\ncmd = "{g.cmd}"\n\n' for g in gates)
+    return "".join(f'[[quality.gates]]\nname = "{g.name}"\ncmd = "{g.cmd}"\n'
+                   + ("fast = true\n" if g.fast else "") + "\n" for g in gates)
