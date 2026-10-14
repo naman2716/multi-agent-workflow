@@ -44,13 +44,16 @@ PLAN_SCHEMA = {
                                     "description": "paths or globs this task may touch"},
                     "depends_on": {"type": "array", "items": {"type": "string"}},
                     "complexity": {"type": "string", "enum": ["small", "large"]},
+                    "estimated_lines": {"type": "integer", "description":
+                                        "changed lines the diff will need (code, tests, docs, committed data)"},
+                    "size_notes": {"type": "string", "description": "what dominates the size"},
                     "model": {"type": "string", "description":
                               "optional worker model override; omit unless the card clearly needs it"},
                     "test_first": {"type": "boolean", "description":
                                    "true if the card changes money, stored data, or auth/permissions"},
                 },
                 "required": ["key", "title", "spec", "acceptance_criteria", "non_goals",
-                             "files_scope", "depends_on", "complexity"],
+                             "files_scope", "depends_on", "complexity", "estimated_lines"],
             },
         },
         "open_questions": {"type": "array", "items": {"type": "string"}},
@@ -180,7 +183,7 @@ each in its own git worktree, with no shared conversation. A worker only sees it
 
 Rules for good tasks:
 - Vertical slices that are independently testable. Each task should be reviewable as one
-  small diff (aim for under ~300 changed lines).
+  small diff that fits the diff-size limit (see Sizing).
 - files_scope must be specific (paths or globs). Two tasks that can run at the same time
   must NOT share files. If they must, add a depends_on edge.
 - Shared foundations (schemas, types, interfaces, migrations) come first; dependents list them.
@@ -199,7 +202,8 @@ Check it against the goal and the actual repository (read-only):
 - every part of the goal is covered, nothing beyond it is added;
 - files_scope paths are real (or clearly new files in existing folders) and specific;
 - cards that would touch the same files or call into each other are ordered with depends_on;
-- each card is one reviewable diff (under ~300 changed lines); split ones that aren't;
+- each card is one reviewable diff that fits the Sizing rules; check estimated_lines against the
+  repository and split cards that don't fit;
 - acceptance criteria are concrete and testable; non_goals name tempting extras;
 - test_first is set on cards changing money, stored data or auth/permissions.
 Return verdict "ok" with the plan unchanged if it is sound; otherwise "revise", list each
@@ -286,6 +290,24 @@ You write the acceptance tests for ONE task card BEFORE anyone implements it.
   ask questions. Report "blocked" only if the card can't be tested at all.
 - These files will be locked: the implementer can't edit them.
 Your final answer must be the structured report."""
+
+
+def sizing_rules(cfg: Config) -> str:
+    """How big a card may be, from the project's diff gate (planner, critic and triage)."""
+    limit = cfg.max_diff_lines
+    split_at = int(limit * cfg.split_above)
+    return f"""
+
+## Sizing
+The diff gate rejects a card whose change is over {limit} changed lines (lockfiles and generated
+files listed in diff_exclude don't count; tests, docs and committed data do). A card rejected for
+size is thrown away and split, so size cards before work starts:
+- Give every card estimated_lines: the code, tests, docs and committed data its diff will need.
+  Look at the files it touches to estimate; don't guess low.
+- Split any card estimated above {split_at} lines into cards ordered with depends_on.
+- Generated or example data (JSON payloads, fixtures, snapshots, seed data) counts in full. Keep
+  committed examples small and hand-trimmed, and build full data at test time instead.
+- Say in size_notes what dominates the size."""
 
 
 def model_family(model: str) -> str:
@@ -530,7 +552,7 @@ class ClaudeRunner:
         root = cwd or cfg.repo
         opts = ClaudeAgentOptions(
             cwd=str(root), model=cfg.planner_model,
-            system_prompt=PLANNER_SYSTEM + guide + _context(cfg),
+            system_prompt=PLANNER_SYSTEM + sizing_rules(cfg) + guide + _context(cfg),
             tools=base, allowed_tools=allowed, mcp_servers=servers, strict_mcp_config=True,
             setting_sources=["project"], max_turns=60, session_id=_new_session(),
             max_budget_usd=cfg.task_budget_usd * 2, env=agent_env(),
@@ -641,7 +663,7 @@ class ClaudeRunner:
         servers, allowed, guide = _graph_opts(cfg, graph, base)
         opts = ClaudeAgentOptions(
             cwd=str(cwd), model=cfg.planner_model,
-            system_prompt=TRIAGE_SYSTEM + guide + _context(cfg),
+            system_prompt=TRIAGE_SYSTEM + sizing_rules(cfg) + guide + _context(cfg),
             tools=base, allowed_tools=allowed, mcp_servers=servers, strict_mcp_config=True,
             setting_sources=["project"], max_turns=30, session_id=_new_session(),
             max_budget_usd=cfg.task_budget_usd, env=agent_env(),
@@ -658,7 +680,7 @@ class ClaudeRunner:
         root = cwd or cfg.repo
         opts = ClaudeAgentOptions(
             cwd=str(root), model=cfg.planner_model,
-            system_prompt=CRITIC_SYSTEM + guide + _context(cfg),
+            system_prompt=CRITIC_SYSTEM + sizing_rules(cfg) + guide + _context(cfg),
             tools=base, allowed_tools=allowed, mcp_servers=servers, strict_mcp_config=True,
             setting_sources=["project"], max_turns=40, session_id=_new_session(),
             max_budget_usd=cfg.task_budget_usd * 2, env=agent_env(),

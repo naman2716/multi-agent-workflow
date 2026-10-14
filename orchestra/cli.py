@@ -200,7 +200,7 @@ def cmd_plan(args) -> None:
     save_plan(plan_path, goal, plan, source=source)
     try:
         tasks, warnings = build_tasks(plan, start=len(store.all()) + 1, graph=graph_data,
-                                      existing=store.open_tasks(), root=cwd)
+                                      existing=store.open_tasks(), root=cwd, split_at=_split_at(cfg))
     except PlanError as e:
         sys.exit(f"Plan invalid: {e}\nEdit {plan_path} and run `orchestra approve`.")
     print(render_plan(tasks, warnings, plan))
@@ -219,6 +219,11 @@ def cmd_plan(args) -> None:
         print("Not queued. Edit the plan if needed, then `orchestra approve`.")
 
 
+def _split_at(cfg: Config) -> int:
+    """Cards estimated above this many changed lines should be split before they run."""
+    return int(cfg.max_diff_lines * cfg.split_above)
+
+
 def cmd_approve(args) -> None:
     cfg = Config.load(_repo(args))
     store = _store(cfg)
@@ -227,7 +232,7 @@ def cmd_approve(args) -> None:
     if _already_queued(store, plan, args.force):
         return
     tasks, warnings = build_tasks(plan, start=len(store.all()) + 1, graph=_graph_data(cfg),
-                                  existing=store.open_tasks())
+                                  existing=store.open_tasks(), split_at=_split_at(cfg))
     print(render_plan(tasks, warnings, plan))
     source = plan.get("source") if isinstance(plan.get("source"), dict) else None
     _queue(store, tasks, plan, plan.get("goal", ""), source)
@@ -243,7 +248,7 @@ def cmd_add(args) -> None:
     if _already_queued(store, {"tasks": items}, args.force):
         return
     tasks, warnings = build_tasks({"tasks": items}, start=len(store.all()) + 1, graph=_graph_data(cfg),
-                                  existing=store.open_tasks())
+                                  existing=store.open_tasks(), split_at=_split_at(cfg))
     _queue(store, tasks, {"tasks": items})
     for w in warnings:
         print("note:", w)

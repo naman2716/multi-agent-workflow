@@ -169,6 +169,7 @@ class Config:
     escalate_on_retry: bool = True  # retry a failed small card on the large-worker model
 
     max_diff_lines: int = 600
+    split_above: float = 0.7  # planner/critic split cards estimated above this share of max_diff_lines
     diff_exclude: list[str] = field(default_factory=lambda: list(DEFAULT_DIFF_EXCLUDE))
     enforce_file_scope: bool = True
     setup_cmd: str = ""  # run once in each new worktree, e.g. "npm ci"
@@ -245,6 +246,7 @@ class Config:
             test_writer_model=pm["test_writer"],
             escalate_on_retry=m.get("escalate_on_retry", True),
             max_diff_lines=q.get("max_diff_lines", 600),
+            split_above=q.get("split_above", 0.7),
             diff_exclude=q.get("diff_exclude", list(DEFAULT_DIFF_EXCLUDE)),
             enforce_file_scope=q.get("enforce_file_scope", True),
             setup_cmd=q.get("setup_cmd", ""),
@@ -394,6 +396,7 @@ comment = false                 # comment on the ticket when cards are queued an
 
 [quality]
 max_diff_lines = 600       # reject oversized diffs (comprehension debt)
+split_above = 0.7          # plans split cards estimated above this share of max_diff_lines
 # files whose changed lines don't count toward max_diff_lines (lockfiles, generated code)
 diff_exclude = ["*.lock", "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "pubspec.lock", "go.sum", "poetry.lock", "uv.lock", "Cargo.lock"]
 enforce_file_scope = true  # reject edits outside a task's declared files

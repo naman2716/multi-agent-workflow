@@ -77,6 +77,7 @@ MIGRATIONS = [  # columns added after v0.1; applied idempotently
     ("locked_tests", "TEXT NOT NULL DEFAULT '[]'"),  # JSON: those test files, locked for the worker
     ("triaged", "INTEGER NOT NULL DEFAULT 0"),  # a triage agent already looked at it (once per card)
     ("source", "TEXT"),          # where the card came from: "linear:ENG-123", "ci", ...
+    ("estimated_lines", "INTEGER NOT NULL DEFAULT 0"),  # the plan's size estimate (0 = none)
 ]
 
 JSON_FIELDS = ("acceptance", "non_goals", "files_scope", "depends_on", "feedback", "decisions",
@@ -136,6 +137,7 @@ class Task:
     locked_tests: list[str] = field(default_factory=list)
     triaged: bool = False
     source: str | None = None
+    estimated_lines: int = 0
     status: str = "pending"
     attempts: int = 0
     feedback: list[str] = field(default_factory=list)
@@ -185,12 +187,13 @@ class Store:
             self.conn.execute(
                 """INSERT INTO tasks (id,title,spec,acceptance,non_goals,files_scope,depends_on,
                    complexity,model,status,attempts,feedback,created_at,updated_at,seq,test_first,
-                   triaged,source)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,0,'[]',?,?,?,?,?,?)""",
+                   triaged,source,estimated_lines)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,0,'[]',?,?,?,?,?,?,?)""",
                 (task.id, task.title, task.spec, json.dumps(task.acceptance),
                  json.dumps(task.non_goals), json.dumps(task.files_scope),
                  json.dumps(task.depends_on), task.complexity, task.model, task.status,
-                 now, now, seq, 1 if task.test_first else 0, 1 if task.triaged else 0, task.source),
+                 now, now, seq, 1 if task.test_first else 0, 1 if task.triaged else 0, task.source,
+                 int(task.estimated_lines or 0)),
             )
         self.log(task.id, "created", task.title)
 

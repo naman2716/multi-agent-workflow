@@ -53,10 +53,12 @@ def _ancestors(tid: str, deps: dict[str, list[str]], seen: set[str] | None = Non
 
 
 def build_tasks(plan: dict, id_prefix: str = "T", start: int = 1, graph=None,
-                existing: list[Task] | None = None, root: Path | None = None) -> tuple[list[Task], list[str]]:
+                existing: list[Task] | None = None, root: Path | None = None,
+                split_at: int | None = None) -> tuple[list[Task], list[str]]:
     """Validate the plan, assign stable ids, and serialize tasks whose files overlap
     (or, with a code graph, whose code calls into each other) — with each other and with
-    `existing` cards still open from earlier plans.
+    `existing` cards still open from earlier plans. With `split_at`, cards estimated above
+    that many changed lines are flagged for splitting.
 
     Returns (tasks in topological order, warnings)."""
     raw = plan.get("tasks", [])
@@ -134,6 +136,13 @@ def build_tasks(plan: dict, id_prefix: str = "T", start: int = 1, graph=None,
                 if not folder.exists():
                     warnings.append(f"{tid}: folder of {p!r} doesn't exist in the repo; check the path")
 
+    if split_at:
+        for tid in order:
+            est = _estimate(by_id[tid])
+            if est > split_at:
+                warnings.append(f"{tid}: estimated {est} changed lines, above the {split_at}-line split "
+                                "threshold; split it before approving, or it may fail the diff gate")
+
     tasks = [Task(id=tid, title=by_id[tid]["title"], spec=by_id[tid]["spec"],
                   acceptance=by_id[tid].get("acceptance_criteria", []),
                   non_goals=by_id[tid].get("non_goals", []),
@@ -141,9 +150,17 @@ def build_tasks(plan: dict, id_prefix: str = "T", start: int = 1, graph=None,
                   depends_on=deps[tid],
                   complexity=by_id[tid].get("complexity", "small"),
                   model=by_id[tid].get("model") or None,
-                  test_first=bool(by_id[tid].get("test_first", False)))
+                  test_first=bool(by_id[tid].get("test_first", False)),
+                  estimated_lines=_estimate(by_id[tid]))
              for tid in order]
     return tasks, warnings
+
+
+def _estimate(item: dict) -> int:
+    try:
+        return max(int(item.get("estimated_lines") or 0), 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def save_plan(path: Path, goal: str, plan: dict, source: dict | None = None) -> None:
@@ -158,7 +175,8 @@ def render_plan(tasks: list[Task], warnings: list[str], plan: dict) -> str:
         dep = f"  (after {', '.join(t.depends_on)})" if t.depends_on else ""
         model = f", model={t.model}" if t.model else ""
         tf = ", test-first" if t.test_first else ""
-        lines.append(f"{t.id} [{t.complexity}{model}{tf}] {t.title}{dep}")
+        size = f", ~{t.estimated_lines} lines" if t.estimated_lines else ""
+        lines.append(f"{t.id} [{t.complexity}{model}{tf}{size}] {t.title}{dep}")
         lines.append(f"     scope: {', '.join(t.files_scope) or 'unrestricted'}")
         for a in t.acceptance:
             lines.append(f"     ✓ {a}")

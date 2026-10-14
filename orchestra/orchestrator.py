@@ -1131,7 +1131,8 @@ class Orchestrator:
         dependents = self._dependents(task.id, tasks)
         existing = [t for t in self.store.open_tasks() if t.id != task.id and t.id not in dependents]
         try:
-            new, _ = build_tasks({"tasks": items}, start=len(tasks) + 1, existing=existing)
+            new, notes = build_tasks({"tasks": items}, start=len(tasks) + 1, existing=existing,
+                                     split_at=int(self.cfg.max_diff_lines * self.cfg.split_above))
         except (PlanError, KeyError, TypeError, AttributeError) as e:
             raise TriageRejected(f"its split was invalid ({e})") from None
         if task.files_scope:
@@ -1141,6 +1142,9 @@ class Orchestrator:
                 raise TriageRejected("the split reaches outside the card's files_scope ("
                                      + "; ".join(outside[:3]) + ")")
         ids = [n.id for n in new]
+        for note in notes:
+            if "split threshold" in note:
+                self.say(task.id, f"triage split: {note}", "warn")
         for n in new:
             n.depends_on = list(dict.fromkeys(n.depends_on + task.depends_on))
             n.test_first, n.source, n.triaged = task.test_first, task.source, True
