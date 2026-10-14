@@ -314,6 +314,14 @@ def cmd_status(args) -> None:
             print(f"\nsummary: {t.summary}")
         for i, f in enumerate(t.feedback, 1):
             print(f"\n--- feedback {i} ---\n{f}")
+        sessions = store.sessions(t.id)
+        if sessions:
+            print("\nsessions:")
+            for s in sessions:
+                when = time.strftime("%m-%d %H:%M", time.localtime(s["started_at"] or 0))
+                print(f"  {s['role'] or '?':11} {(s['model'] or '?').replace('claude-', ''):12} "
+                      f"{s['session_id'][:8]}  {when}  {s['runs']} run(s)  ${s['cost_usd']:.2f}  "
+                      f"{s['end_reason'] or ''}")
         print("\nrecent events:")
         for e in reversed(store.events(t.id, 20)):
             print(f"  {e['kind']:8} {e['detail'][:150]}")

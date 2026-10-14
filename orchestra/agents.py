@@ -459,6 +459,7 @@ class AgentResult:
     session_id: str | None = None
     limited: bool = False            # cut off by a usage/rate limit
     resets_at: float | None = None   # when that limit resets (unix seconds), if known
+    model: str = ""                  # the model that did most of the work
 
 
 def _tokens(model_usage: dict | None) -> int:
@@ -467,6 +468,12 @@ def _tokens(model_usage: dict | None) -> int:
         total += sum(int(u.get(k, 0) or 0) for k in
                      ("inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens"))
     return total
+
+
+def _main_model(model_usage: dict | None) -> str:
+    """The model id that used the most tokens (the CLI may also call a small helper model)."""
+    usage = {m: _tokens({m: u}) for m, u in (model_usage or {}).items()}
+    return max(usage, key=usage.get) if usage else ""
 
 
 class Runner(Protocol):
@@ -545,6 +552,7 @@ class ClaudeRunner:
                                resets_at=resets_at, session_id=session_id)
         cost = result.total_cost_usd or 0.0
         tokens = _tokens(result.model_usage)
+        model = _main_model(result.model_usage) or str(getattr(options, "model", "") or "")
         data = result.structured_output
         session_id = result.session_id or session_id
         if result.is_error or not isinstance(data, dict):
@@ -553,8 +561,8 @@ class ClaudeRunner:
             limited = limited or result.api_error_status == 429 or \
                 (result.terminal_reason == "api_error" and looks_like_limit(text))
             return AgentResult({}, cost, ok=False, tokens=tokens, error=text, limited=limited,
-                               resets_at=resets_at, session_id=session_id)
-        return AgentResult(data, cost, tokens=tokens, session_id=session_id)
+                               resets_at=resets_at, session_id=session_id, model=model)
+        return AgentResult(data, cost, tokens=tokens, session_id=session_id, model=model)
 
     async def plan(self, cfg: Config, goal: str, cwd: Path | None = None,
                    graph: Path | None = None) -> AgentResult:

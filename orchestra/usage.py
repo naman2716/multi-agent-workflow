@@ -239,25 +239,29 @@ def read_session(path: Path, root: Path, results: list[ToolResult] | None = None
 
 
 # ---------------------------------------------------------------- queue state
-def _state_rows(root: Path) -> tuple[list[dict], list[dict]]:
-    """Tasks and events from tasks.json/events.json or state.db, at root or root/state."""
+def _state_rows(root: Path) -> tuple[list[dict], list[dict], list[dict]]:
+    """Tasks, events and recorded sessions from the JSON files or state.db, at root or root/state."""
     for d in (root, root / "state"):
         if (d / "tasks.json").exists():
-            events = json.loads((d / "events.json").read_text()) if (d / "events.json").exists() else []
-            return json.loads((d / "tasks.json").read_text()), events
+            def load(name):
+                return json.loads((d / name).read_text()) if (d / name).exists() else []
+            return load("tasks.json"), load("events.json"), load("sessions.json")
         if (d / "state.db").exists():
             conn = sqlite3.connect(f"file:{d / 'state.db'}?mode=ro", uri=True)
             conn.row_factory = sqlite3.Row
             try:
+                has_sessions = conn.execute("SELECT 1 FROM sqlite_master WHERE name='sessions'").fetchone()
                 return ([dict(r) for r in conn.execute("SELECT * FROM tasks")],
-                        [dict(r) for r in conn.execute("SELECT * FROM events ORDER BY id")])
+                        [dict(r) for r in conn.execute("SELECT * FROM events ORDER BY id")],
+                        [dict(r) for r in conn.execute("SELECT * FROM sessions")] if has_sessions else [])
             finally:
                 conn.close()
-    return [], []
+    return [], [], []
 
 
-def load_cards(root: Path) -> dict[str, Card]:
-    tasks, events = _state_rows(root)
+def load_cards(root: Path, tasks: list[dict] | None = None, events: list[dict] | None = None) -> dict[str, Card]:
+    if tasks is None:
+        tasks, events, _ = _state_rows(root)
     cards = {t["id"]: Card(t["id"], t.get("title", ""), t.get("status", ""), t.get("attempts", 0),
                            bool(t.get("triaged")), bool(t.get("test_first")), t.get("cost_usd"))
              for t in tasks}
@@ -286,7 +290,13 @@ def build(root: Path) -> Report:
     tdir = root / "agent-transcripts" if (root / "agent-transcripts").is_dir() else root
     results: list[ToolResult] = []
     sessions = [s for p in sorted(tdir.rglob("*.jsonl")) if (s := read_session(p, tdir, results))]
-    cards = load_cards(root)
+    tasks, events, recorded = _state_rows(root)
+    by_id = {r["session_id"]: r for r in recorded if r.get("session_id")}
+    for s in sessions:  # Orchestra's own record beats guessing from the prompt
+        r = by_id.get(Path(s.path).stem)
+        if r and r.get("role"):
+            s.role, s.card = r["role"], r.get("task_id") or s.card
+    cards = load_cards(root, tasks, events)
     for s in sessions:
         if s.role != "interactive":
             cards.setdefault(s.card, Card(s.card))

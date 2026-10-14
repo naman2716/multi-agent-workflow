@@ -303,5 +303,94 @@ class OneValidatorPerReview(Base):
         self.assertEqual(classify(p), "validator")  # orchestra usage still recognizes the session
 
 
+class SessionRecords(Base):
+    def ids(self, runner_cls=FakeRunner):
+        class R(runner_cls):
+            async def review(inner, *a, **kw):
+                r = await super().review(*a, **kw)
+                r.session_id, r.model = f"rev{inner.review_calls[a[1].id]}", "claude-opus-5-5"
+                return r
+        return R
+
+    def test_store_keeps_one_row_per_session(self):
+        self.add("C", ["c.py"])
+        self.store.add_cost("C", 0.3, 100, "s1", role="worker", model="m", attempt=1, started_at=10.0,
+                            end_reason="gate_failed")
+        self.store.add_cost("C", 0.5, 150, "s1", role="worker", attempt=1, end_reason="done")
+        (row,) = self.store.sessions("C")
+        self.assertEqual((row["role"], row["model"], row["runs"], row["started_at"], row["end_reason"]),
+                         ("worker", "m", 2, 10.0, "done"))
+        self.assertAlmostEqual(row["cost_usd"], 0.5)
+        self.store.end_session("s1", "review_rejected")
+        self.assertEqual(self.store.sessions("C")[0]["end_reason"], "review_rejected")
+
+    def test_old_sessions_table_gets_the_new_columns(self):
+        import sqlite3
+        db = self.tmp / "old.db"
+        conn = sqlite3.connect(db)
+        conn.execute("CREATE TABLE sessions (session_id TEXT PRIMARY KEY, task_id TEXT, "
+                     "cost_usd REAL NOT NULL DEFAULT 0, tokens INTEGER NOT NULL DEFAULT 0)")
+        conn.commit()
+        conn.close()
+        cols = {r[1] for r in Store(db).conn.execute("PRAGMA table_info(sessions)")}
+        self.assertTrue({"role", "model", "end_reason", "runs", "started_at", "ended_at"} <= cols)
+
+    def test_a_run_records_roles_runs_and_end_reasons(self):
+        self.add("T01", ["calc.py", "test_calc.py"])
+        bad = done(**{"calc.py": "def add(a, b):\n    return a - b\n"})
+        good = done(**{"calc.py": "def add(a, b):\n    return a + b  # fixed\n"})
+        step = lambda wt, n, task: (bad if n == 0 else good)(wt, n, task)  # noqa: E731
+        self.run_orch(self.ids()({"T01": [running_total(step, "w1", [0.3, 0.5])]}))
+        rows = {r["session_id"]: r for r in self.store.sessions("T01")}
+        self.assertEqual((rows["w1"]["role"], rows["w1"]["runs"], rows["w1"]["end_reason"]), ("worker", 2, "done"))
+        self.assertEqual((rows["rev1"]["role"], rows["rev1"]["model"], rows["rev1"]["end_reason"]),
+                         ("reviewer", "claude-opus-5-5", "done"))
+        self.assertEqual(rows["w1"]["attempt"], 1)
+
+    def test_rejected_and_interrupted_sessions_say_so(self):
+        self.cfg.max_attempts, self.cfg.review.fix_rounds, self.cfg.review.validate = 1, 0, False
+        self.add("R", ["r.py"])
+        self.run_orch(self.ids()({"R": [sess(done(**{"r.py": "x = 1\n"}), "w9")]}, review={"R": ["reject"]}))
+        self.assertEqual({r["session_id"]: r["end_reason"] for r in self.store.sessions("R")}["w9"], "review_rejected")
+        self.add("I", ["i.py"])
+        self.store.add_cost("I", 0.1, 1, "w10", role="worker", end_reason="done")
+        self.store.update("I", status="running", attempts=1, session_id="w10")
+        orch = Orchestrator(self.cfg, self.store, FakeRunner({}), log=self.logs.append)
+        asyncio.run(orch._recover())
+        self.assertEqual(self.store.sessions("I")[0]["end_reason"], "interrupted")
+
+    def test_a_blocked_report_ends_the_session_as_blocked(self):
+        from tests.test_orchestra import blocked
+        self.add("B", ["b.py"])
+        self.run_orch(FakeRunner({"B": [sess(blocked, "wb")]}))
+        self.assertEqual(self.store.sessions("B")[0]["end_reason"], "blocked")
+
+    def test_main_model_and_usage_prefers_recorded_roles(self):
+        from orchestra.agents import _main_model
+        self.assertEqual(_main_model({"claude-haiku-5-5": {"inputTokens": 10},
+                                      "claude-opus-5-5": {"inputTokens": 5, "cacheReadInputTokens": 900}}),
+                         "claude-opus-5-5")
+        from tests.test_usage import CARD, enqueue, turn, write
+        root = self.tmp / "export"
+        write(root / "agent-transcripts" / "misc" / "abc.jsonl", [*enqueue(CARD), *turn("m1")])
+        (root / "state").mkdir()
+        (root / "state" / "tasks.json").write_text("[]")
+        (root / "state" / "sessions.json").write_text('[{"session_id": "abc", "task_id": "T02", "role": "reviewer"}]')
+        from orchestra import usage
+        (sess_,) = usage.build(root).sessions
+        self.assertEqual((sess_.role, sess_.card), ("reviewer", "T02"))
+
+    def test_status_lists_a_cards_sessions(self):
+        import io
+        from contextlib import redirect_stdout
+        from orchestra.cli import main
+        self.add("S", ["s.py"])
+        self.store.add_cost("S", 0.42, 10, "abcdef123", role="validator", model="claude-opus-5-5", end_reason="done")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            main(["--repo", str(self.repo), "status", "S"])
+        self.assertRegex(out.getvalue(), r"validator\s+opus-5-5\s+abcdef12 .* 1 run\(s\)  \$0.42  done")
+
+
 if __name__ == "__main__":
     unittest.main()
