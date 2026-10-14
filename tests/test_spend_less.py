@@ -478,5 +478,22 @@ class BashOutputCap(unittest.TestCase):
             self.assertEqual(Config.load(Path(d)).agents.bash_output_max_chars, 12000)
 
 
+class StablePromptOrder(unittest.TestCase):
+    def test_reviewer_note_comes_after_the_diff(self):
+        with tempfile.TemporaryDirectory() as d:
+            r, task = CapturingRunner(), Task(id="T1", title="t", spec="s")
+            asyncio.run(r.review(Config(repo=Path(d)), task, Path(d), "DIFFTEXT", {"summary": "s"}, "GATES",
+                                 impact="IMPACT", note="This is a revision."))
+            p = r.prompt
+            order = [p.index(x) for x in ("# Task T1", "## Worker's report", "GATES", "IMPACT", "DIFFTEXT",
+                                          "## Context for this review")]
+            self.assertEqual(order, sorted(order))
+            first = r.prompt
+            asyncio.run(r.review(Config(repo=Path(d)), task, Path(d), "DIFFTEXT", {"summary": "s"}, "GATES",
+                                 impact="IMPACT", note="Resolved conflicts in a.py."))
+            shared = first.index("## Context for this review")
+            self.assertEqual(r.prompt[:shared], first[:shared])  # only the note differs, at the end
+
+
 if __name__ == "__main__":
     unittest.main()

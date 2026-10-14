@@ -663,10 +663,11 @@ class ClaudeRunner:
         impact_block = (f"## Impact (from the code graph: code outside this diff that depends on "
                         f"changed symbols; check these still work)\n{impact}\n\n" if impact else "")
         note_block = f"## Context for this review\n{note}\n\n" if note else ""
-        prompt = (f"{task_card(task)}\n\n{note_block}## Worker's report\n```json\n"
+        # the per-round note goes last, so a re-review shares everything before it
+        prompt = (f"{task_card(task)}\n\n## Worker's report\n```json\n"
                   f"{json.dumps(work_report, indent=2)}\n```\n\n"
                   f"## Automated gates\n{gate_log}\n\n{impact_block}## Diff\n```diff\n{diff}\n```\n\n"
-                  "Read surrounding code and run what helps, then give your verdict.")
+                  f"{note_block}Read surrounding code and run what helps, then give your verdict.")
         opts = self._checker_options(cfg, worktree, graph, model or cfg.reviewer_model, REVIEWER_SYSTEM,
                                      REVIEW_SCHEMA, env, max_turns=40)
         return await self._run(prompt, opts, f"{task.id}:review")
