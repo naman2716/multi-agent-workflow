@@ -17,7 +17,7 @@ goal ─► Planner (Opus, read-only, at the integration head) ─► Critic ─
    commit → gates: secrets · conflict markers · diff size · scope · your lint/typecheck/tests
         fail → feedback → worker fixes (same session, ≤2 rounds)
    squash to one commit → Reviewer (other model family, can run tests, never edits)
-        blocking findings → validators confirm or refute each
+        blocking findings → one validator confirms or refutes each
         fixable reject → worker revises in the same session → review again
         wrong approach → fresh attempt (≤ max_attempts)
         attempts used up / worker blocked → triage: rewrite · stronger model · split · or you
@@ -115,6 +115,7 @@ orchestra retry T03 --note "Use the existing FCM helper in src/notify"
 orchestra test-first T04            # locked acceptance tests before the worker (or --off)
 orchestra ship                      # push + draft PR + CI by hand (runs do it with [ship].auto)
 orchestra ntfy setup                # once per project: questions and results on your phone
+orchestra usage path/to/export      # tokens and cost per card, role and session from agent transcripts
 ```
 
 ### Interactive side: the Claude Code harness
@@ -238,10 +239,10 @@ If it's interrupted anyway, re-running picks up where it left off.
 - **The reviewer can run code and isn't the author's model.** With `reviewer_rule = "opposite"`
   Sonnet-written cards are reviewed by Opus and Opus-written by Sonnet. It has sandboxed Bash
   (`reviewer_shell`) to run tests; it can't edit, and whatever it leaves is discarded.
-- **Rejections are verified.** Each blocking finding (unmet criterion, blocker/major issue,
-  scope creep; up to 5) goes to a validator agent (`validator` model). Only findings it refutes
-  with evidence are dropped; if none remain, the card is approved. Validators run only on
-  rejections.
+- **Rejections are verified.** A review's blocking findings (unmet criteria, blocker/major issues,
+  scope creep; up to 5) go together to one validator session (`validator` model), which returns a
+  verdict per finding. Only findings it refutes with evidence are dropped; if none remain, the
+  card is approved. Validators run only on rejections.
 
 ## Test-first cards
 
@@ -356,6 +357,13 @@ ordering, card size, criteria and `test_first`, and its corrected plan replaces 
 is valid; its notes are printed under "Critic". Scope paths whose folder doesn't exist are
 flagged. Ready cards that more work waits on are dispatched first.
 
+Cards are sized before they run: planner, critic and triage see the real `max_diff_lines` and give
+each card `estimated_lines`; anything above `[quality].split_above` (default 0.7) of the limit
+should be split, and the printed plan flags cards that weren't. Generated or example data counts.
+While a worker runs, a size check after each edit tells it when it nears and passes the limit, so
+it stops and reports blocked instead of writing it all. A diff over `oversize_triage_factor`
+(default 1.5) times the limit goes straight to triage to be split, without a trim round.
+
 ## Safety: sandbox, guards and the run lease
 
 - **Sandbox (on by default).** Worker shell commands run in Claude Code's OS sandbox (Seatbelt
@@ -374,7 +382,9 @@ flagged. Ready cards that more work waits on are dispatched first.
   taken over. `cancel` on a card a live run is working on, and `retry` on a merged or running
   card, need `--force`.
 - **Budget.** `total_budget_usd` caps each run; `orchestra status` shows lifetime spend, the
-  last run's spend and the cap.
+  last run's spend and the cap. A resumed session reports its running total, so only the growth
+  since its last report is counted. `orchestra status T03` lists the card's agent sessions:
+  role, model, runs, cost and why each ended.
 
 ## Tuning
 
@@ -386,6 +396,14 @@ flagged. Ready cards that more work waits on are dispatched first.
   and sends it back once with the failures. Enable it after the smoke test below shows it works
   with your SDK version.
 - **Concurrency 2–4.** Rate limits are pooled across all sessions on your account.
+- **`[agents]` cost settings.** `cache_ttl = "5m"` (default) has agent sessions write the prompt
+  cache for 5 minutes (1.25× input price) instead of an hour (2×). `bash_output_max_chars = 8000`
+  returns longer worker Bash output as its head and tail with a `[truncated N chars]` note
+  (0 = off).
+- **Where the money went.** `orchestra usage <export-dir>` breaks an export of agent transcripts
+  (`agent-transcripts/<card>/*.jsonl` plus `tasks.json`/`events.json`/`sessions.json` or
+  `state.db`) down by card, role, model and session: tokens, estimated USD, cold starts, resume
+  rounds and large tool outputs.
 - **Models:** Opus plans and reviews; Sonnet does `small` tasks, Opus does `large` ones.
 - **Cost:** expect roughly 2–5× a single agent. The live smoke test (1 small task:
   worker + gates + review + merge) cost about $0.18 with Haiku/Sonnet.

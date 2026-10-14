@@ -66,10 +66,12 @@ class FakeRunner:
         steps = self.tests_script[task.id]
         return steps[min(n, len(steps) - 1)](wt, n, task)
 
-    async def validate(self, cfg, task, wt, diff, finding, env=None):
-        self.validations.setdefault(task.id, []).append(finding["text"])
+    async def validate(self, cfg, task, wt, diff, findings, env=None):
+        self.validations.setdefault(task.id, []).extend(f["text"] for f in findings)
+        self.validate_calls = getattr(self, "validate_calls", 0) + 1
         confirmed = self.validate_script.get(task.id, True)
-        return AgentResult({"confirmed": confirmed, "evidence": "checked by fake validator"}, 0.05)
+        return AgentResult({"findings": [{"index": i, "confirmed": confirmed, "evidence": "checked by fake validator"}
+                                         for i in range(1, len(findings) + 1)]}, 0.05)
 
     async def work(self, cfg, task, wt, graph=None, resume=None, env=None):
         self.graphs[task.id] = graph

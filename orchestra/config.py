@@ -94,6 +94,24 @@ class Planning:
     critic: bool = True          # a critic agent reviews every plan and returns a corrected one
 
 
+CACHE_TTLS = {"5m": {"FORCE_PROMPT_CACHING_5M": "1"}, "1h": {"ENABLE_PROMPT_CACHING_1H": "1"}, "auto": {}}
+
+
+@dataclass
+class AgentSettings:
+    """How agent sessions run (passed to the Claude Code CLI behind each one)."""
+    # Prompt-cache lifetime. Writes cost 1.25x input for 5 minutes and 2x for 1 hour; agent turns
+    # rarely sit idle over 5 minutes, so "5m" is cheaper. "auto" leaves it to the CLI.
+    cache_ttl: str = "5m"
+    # Workers' and test writers' Bash output above this many chars comes back as its head and
+    # tail with a "[truncated N chars]" note (0 = off; the CLI then keeps only the first 30000).
+    bash_output_max_chars: int = 8000
+
+    def __post_init__(self):
+        if self.cache_ttl not in CACHE_TTLS:
+            raise ValueError(f"[agents] cache_ttl must be one of {list(CACHE_TTLS)}, not {self.cache_ttl!r}")
+
+
 @dataclass
 class Autonomy:
     """Self-healing: a triage agent looks at a card before it is blocked."""
@@ -169,6 +187,8 @@ class Config:
     escalate_on_retry: bool = True  # retry a failed small card on the large-worker model
 
     max_diff_lines: int = 600
+    split_above: float = 0.7  # planner/critic split cards estimated above this share of max_diff_lines
+    oversize_triage_factor: float = 1.5  # a diff this many times the limit goes to triage, not a trim round
     diff_exclude: list[str] = field(default_factory=lambda: list(DEFAULT_DIFF_EXCLUDE))
     enforce_file_scope: bool = True
     setup_cmd: str = ""  # run once in each new worktree, e.g. "npm ci"
@@ -188,6 +208,7 @@ class Config:
     decision_wait_minutes: float = 60  # without a terminal, keep running this long for answers
     notify_cmd: str = ""  # shell command run with $ORCHESTRA_TITLE / $ORCHESTRA_MESSAGE
     autonomy: Autonomy = field(default_factory=Autonomy)
+    agents: AgentSettings = field(default_factory=AgentSettings)
     ship: Ship = field(default_factory=Ship)
     ntfy: NtfySettings = field(default_factory=NtfySettings)
     linear: LinearSettings = field(default_factory=LinearSettings)
@@ -245,6 +266,8 @@ class Config:
             test_writer_model=pm["test_writer"],
             escalate_on_retry=m.get("escalate_on_retry", True),
             max_diff_lines=q.get("max_diff_lines", 600),
+            split_above=q.get("split_above", 0.7),
+            oversize_triage_factor=q.get("oversize_triage_factor", 1.5),
             diff_exclude=q.get("diff_exclude", list(DEFAULT_DIFF_EXCLUDE)),
             enforce_file_scope=q.get("enforce_file_scope", True),
             setup_cmd=q.get("setup_cmd", ""),
@@ -265,6 +288,7 @@ class Config:
             ask_in_terminal=o.get("ask_in_terminal", True),
             decision_wait_minutes=o.get("decision_wait_minutes", 60),
             autonomy=section(Autonomy, "autonomy"),
+            agents=section(AgentSettings, "agents"),
             ship=section(Ship, "ship"),
             ntfy=_with_saved_topics(section(NtfySettings, "ntfy"),
                                     repo / o.get("state_dir", ".orchestra") / NTFY_TOPICS_FILE),
@@ -394,6 +418,8 @@ comment = false                 # comment on the ticket when cards are queued an
 
 [quality]
 max_diff_lines = 600       # reject oversized diffs (comprehension debt)
+split_above = 0.7          # plans split cards estimated above this share of max_diff_lines
+oversize_triage_factor = 1.5  # a diff this many times max_diff_lines goes straight to triage (split)
 # files whose changed lines don't count toward max_diff_lines (lockfiles, generated code)
 diff_exclude = ["*.lock", "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "pubspec.lock", "go.sum", "poetry.lock", "uv.lock", "Cargo.lock"]
 enforce_file_scope = true  # reject edits outside a task's declared files
@@ -426,6 +452,10 @@ port_span = 100
 
 [planning]
 critic = true              # a critic agent checks each plan and returns a corrected one
+
+[agents]
+cache_ttl = "5m"           # prompt-cache lifetime for agent sessions: "5m" (cheaper writes), "1h" or "auto"
+bash_output_max_chars = 8000  # longer Bash output reaches workers as head + tail (0 = off)
 
 [sandbox]
 # Worker shell commands run in Claude Code's OS sandbox (Seatbelt on macOS): writes only in

@@ -246,3 +246,60 @@ def hook_main(profile: str, stdin=None) -> int:
         print(reason, file=sys.stderr)
         return 2
     return 0
+
+
+# ---------------------------------------------------------------- Bash output cap
+# The CLI's own output limit keeps only the head of a long output, which drops a test run's
+# failure summary. Instead, a worker's command runs with its output captured to a temp file,
+# and a long output comes back as its head and tail with a note. The command runs in the same
+# shell (no subshell), so `cd` still sticks and the exit status is the command's own; an `exit`
+# inside the command, or a timeout that kills it, still shows the output so far (traps writing
+# to the real stdout, kept on fd 9).
+OUTPUT_CAP_MIN = 2000
+_CAPPED = """__oc_f=$(mktemp "${{TMPDIR:-/tmp}}/orchestra-out.XXXXXX" 2>/dev/null) || __oc_f=""
+__oc_show() {{
+  [ -n "$__oc_f" ] && [ -f "$__oc_f" ] || return 0
+  __oc_n=$(wc -c <"$__oc_f" | tr -d ' ')
+  if [ "$__oc_n" -gt {cap} ]; then
+    head -c {head} "$__oc_f"
+    printf '\\n\\n[truncated %s chars: the middle of this output was cut. Re-run with grep, head or tail, or save it to a file and read parts, if you need it.]\\n\\n' "$((__oc_n - {cap}))"
+    tail -c {tail} "$__oc_f"
+  else
+    cat "$__oc_f"
+  fi
+  rm -f "$__oc_f"
+}}
+exec 9>&1
+trap '__oc_show >&9' EXIT
+trap 'trap - EXIT; __oc_show >&9; exit 143' TERM INT HUP
+{{ {cmd}
+}} >"${{__oc_f:-/dev/stdout}}" 2>&1
+__oc_rc=$?
+trap - EXIT TERM INT HUP
+__oc_show
+exec 9>&-
+unset -f __oc_show
+unset __oc_f __oc_n
+(exit $__oc_rc)"""
+
+
+def cap_command(cmd: str, cap: int) -> str:
+    """`cmd` rewritten so its combined output is at most `cap` chars (plus a note): the first
+    ~3/8 and the last ~5/8, since test runners print their failure summary at the end."""
+    cap = max(int(cap), OUTPUT_CAP_MIN)
+    head = cap * 3 // 8
+    return _CAPPED.format(cmd=cmd, cap=cap, head=head, tail=cap - head)
+
+
+def make_output_cap(cap: int):
+    """Agent SDK PreToolUse hook (Bash): run the command with its output capped (cap_command).
+    Background commands are left alone: their output goes to a file the agent reads itself."""
+    async def hook(input_data: dict[str, Any], tool_use_id: str | None, context: Any) -> dict[str, Any]:
+        args = input_data.get("tool_input") or {}
+        cmd = args.get("command")
+        if input_data.get("tool_name") != "Bash" or not isinstance(cmd, str) or not cmd.strip() \
+                or args.get("run_in_background") or "__oc_show" in cmd:
+            return {}
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                       "updatedInput": {**args, "command": cap_command(cmd, cap)}}}
+    return hook

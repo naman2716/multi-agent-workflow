@@ -57,7 +57,25 @@ CREATE TABLE IF NOT EXISTS events (
     at        REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id    TEXT PRIMARY KEY,
+    task_id       TEXT,
+    cost_usd      REAL NOT NULL DEFAULT 0,     -- the session's running total as last reported
+    tokens        INTEGER NOT NULL DEFAULT 0
+);
 """
+SESSION_COLUMNS = [  # one row per agent session; a resumed session updates its row
+    ("role", "TEXT"),            # worker, test_writer, reviewer, validator, triage
+    ("model", "TEXT"),
+    ("attempt", "INTEGER"),      # the card's attempt number when the session last ran
+    ("started_at", "REAL"),
+    ("ended_at", "REAL"),        # end of its latest run
+    ("end_reason", "TEXT"),      # done, gate_failed, review_rejected, blocked, needs_decision,
+                                 # usage_limit, interrupted, budget, error
+    ("runs", "INTEGER NOT NULL DEFAULT 0"),  # first run plus every resume
+]
+END_REASONS = ("done", "gate_failed", "review_rejected", "blocked", "needs_decision", "usage_limit",
+               "interrupted", "budget", "error")
 MIGRATIONS = [  # columns added after v0.1; applied idempotently
     ("tokens", "INTEGER NOT NULL DEFAULT 0"),
     ("used_graph", "INTEGER NOT NULL DEFAULT 0"),
@@ -71,6 +89,7 @@ MIGRATIONS = [  # columns added after v0.1; applied idempotently
     ("locked_tests", "TEXT NOT NULL DEFAULT '[]'"),  # JSON: those test files, locked for the worker
     ("triaged", "INTEGER NOT NULL DEFAULT 0"),  # a triage agent already looked at it (once per card)
     ("source", "TEXT"),          # where the card came from: "linear:ENG-123", "ci", ...
+    ("estimated_lines", "INTEGER NOT NULL DEFAULT 0"),  # the plan's size estimate (0 = none)
 ]
 
 JSON_FIELDS = ("acceptance", "non_goals", "files_scope", "depends_on", "feedback", "decisions",
@@ -130,6 +149,7 @@ class Task:
     locked_tests: list[str] = field(default_factory=list)
     triaged: bool = False
     source: str | None = None
+    estimated_lines: int = 0
     status: str = "pending"
     attempts: int = 0
     feedback: list[str] = field(default_factory=list)
@@ -170,6 +190,10 @@ class Store:
         for name, ddl in MIGRATIONS:
             if name not in cols:
                 self.conn.execute(f"ALTER TABLE tasks ADD COLUMN {name} {ddl}")
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(sessions)")}
+        for name, ddl in SESSION_COLUMNS:
+            if name not in cols:
+                self.conn.execute(f"ALTER TABLE sessions ADD COLUMN {name} {ddl}")
 
     # ---------- writes ----------
     def add_task(self, task: Task) -> None:
@@ -179,12 +203,13 @@ class Store:
             self.conn.execute(
                 """INSERT INTO tasks (id,title,spec,acceptance,non_goals,files_scope,depends_on,
                    complexity,model,status,attempts,feedback,created_at,updated_at,seq,test_first,
-                   triaged,source)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,0,'[]',?,?,?,?,?,?)""",
+                   triaged,source,estimated_lines)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,0,'[]',?,?,?,?,?,?,?)""",
                 (task.id, task.title, task.spec, json.dumps(task.acceptance),
                  json.dumps(task.non_goals), json.dumps(task.files_scope),
                  json.dumps(task.depends_on), task.complexity, task.model, task.status,
-                 now, now, seq, 1 if task.test_first else 0, 1 if task.triaged else 0, task.source),
+                 now, now, seq, 1 if task.test_first else 0, 1 if task.triaged else 0, task.source,
+                 int(task.estimated_lines or 0)),
             )
         self.log(task.id, "created", task.title)
 
@@ -251,10 +276,43 @@ class Store:
         t = self.get(task_id)
         self.update(task_id, feedback=t.feedback + [note])
 
-    def add_cost(self, task_id: str, usd: float, tokens: int = 0) -> None:
+    def add_cost(self, task_id: str, usd: float, tokens: int = 0, session_id: str | None = None, *,
+                 role: str | None = None, model: str | None = None, attempt: int | None = None,
+                 started_at: float | None = None, end_reason: str | None = None) -> None:
+        """Add one agent call's spend to the card and record the session's run. A resumed session
+        reports its running total (everything since the session began), so for a known session only
+        the part since its last report is added; a run cut off before reporting is picked up by the next."""
+        usd, tokens = usd or 0.0, tokens or 0
         with self._lock:
+            if session_id:
+                row = self.conn.execute("SELECT cost_usd, tokens FROM sessions WHERE session_id=?",
+                                        (session_id,)).fetchone()
+                seen_usd, seen_tok = (row[0], row[1]) if row else (0.0, 0)
+                now = time.time()
+                self.conn.execute(
+                    "INSERT INTO sessions (session_id, task_id, cost_usd, tokens, role, model, attempt, "
+                    "started_at, ended_at, end_reason, runs) VALUES (?,?,?,?,?,?,?,?,?,?,1) "
+                    "ON CONFLICT(session_id) DO UPDATE SET task_id=excluded.task_id, "
+                    "cost_usd=excluded.cost_usd, tokens=excluded.tokens, role=COALESCE(excluded.role, role), "
+                    "model=COALESCE(excluded.model, model), attempt=COALESCE(excluded.attempt, attempt), "
+                    "ended_at=excluded.ended_at, end_reason=COALESCE(excluded.end_reason, end_reason), "
+                    "runs=runs+1",
+                    (session_id, task_id, max(usd, seen_usd), max(tokens, seen_tok), role, model, attempt,
+                     started_at or now, now, end_reason))
+                usd, tokens = max(usd - seen_usd, 0.0), max(tokens - seen_tok, 0)
             self.conn.execute("UPDATE tasks SET cost_usd=cost_usd+?, tokens=tokens+? WHERE id=?",
-                              (usd or 0.0, tokens or 0, task_id))
+                              (usd, tokens, task_id))
+
+    def end_session(self, session_id: str | None, reason: str) -> None:
+        """Why a session stopped being used, when that is decided after its last run."""
+        if session_id:
+            with self._lock:
+                self.conn.execute("UPDATE sessions SET end_reason=? WHERE session_id=?", (reason, session_id))
+
+    def sessions(self, task_id: str | None = None) -> list[dict]:
+        q, args = ("SELECT * FROM sessions WHERE task_id=? ORDER BY started_at", (task_id,)) if task_id \
+            else ("SELECT * FROM sessions ORDER BY started_at", ())
+        return [dict(r) for r in self.conn.execute(q, args)]
 
     def interrupted(self) -> list[Task]:
         """Tasks a previous run left 'running'/'review' (it crashed or was stopped)."""

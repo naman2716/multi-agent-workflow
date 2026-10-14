@@ -19,10 +19,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
-from .config import Config
+from .config import CACHE_TTLS, Config
 from .graph import GRAPH_GUIDE, mcp_tool_names
 from .limits import LimitSignal, looks_like_limit
-from .guards import make_read_guard, make_reviewer_guard, make_worker_guard
+from .guards import make_output_cap, make_read_guard, make_reviewer_guard, make_worker_guard
 from .store import Task
 
 # ---------------------------------------------------------------- schemas
@@ -44,13 +44,16 @@ PLAN_SCHEMA = {
                                     "description": "paths or globs this task may touch"},
                     "depends_on": {"type": "array", "items": {"type": "string"}},
                     "complexity": {"type": "string", "enum": ["small", "large"]},
+                    "estimated_lines": {"type": "integer", "description":
+                                        "changed lines the diff will need (code, tests, docs, committed data)"},
+                    "size_notes": {"type": "string", "description": "what dominates the size"},
                     "model": {"type": "string", "description":
                               "optional worker model override; omit unless the card clearly needs it"},
                     "test_first": {"type": "boolean", "description":
                                    "true if the card changes money, stored data, or auth/permissions"},
                 },
                 "required": ["key", "title", "spec", "acceptance_criteria", "non_goals",
-                             "files_scope", "depends_on", "complexity"],
+                             "files_scope", "depends_on", "complexity", "estimated_lines"],
             },
         },
         "open_questions": {"type": "array", "items": {"type": "string"}},
@@ -107,11 +110,17 @@ REVIEW_SCHEMA = {
 VALIDATE_SCHEMA = {
     "type": "object",
     "properties": {
-        "confirmed": {"type": "boolean", "description":
-                      "false only if you showed the finding is wrong; true if it holds or you can't tell"},
-        "evidence": {"type": "string", "description": "what you read or ran, and what it showed"},
+        "findings": {"type": "array", "description": "one verdict per numbered finding", "items": {
+            "type": "object",
+            "properties": {
+                "index": {"type": "integer", "description": "the finding's number"},
+                "confirmed": {"type": "boolean", "description":
+                              "false only if you showed the finding is wrong; true if it holds or you can't tell"},
+                "evidence": {"type": "string", "description": "what you read or ran, and what it showed"},
+            },
+            "required": ["index", "confirmed", "evidence"]}},
     },
-    "required": ["confirmed", "evidence"],
+    "required": ["findings"],
 }
 
 TESTS_SCHEMA = {
@@ -180,7 +189,7 @@ each in its own git worktree, with no shared conversation. A worker only sees it
 
 Rules for good tasks:
 - Vertical slices that are independently testable. Each task should be reviewable as one
-  small diff (aim for under ~300 changed lines).
+  small diff that fits the diff-size limit (see Sizing).
 - files_scope must be specific (paths or globs). Two tasks that can run at the same time
   must NOT share files. If they must, add a depends_on edge.
 - Shared foundations (schemas, types, interfaces, migrations) come first; dependents list them.
@@ -199,7 +208,8 @@ Check it against the goal and the actual repository (read-only):
 - every part of the goal is covered, nothing beyond it is added;
 - files_scope paths are real (or clearly new files in existing folders) and specific;
 - cards that would touch the same files or call into each other are ordered with depends_on;
-- each card is one reviewable diff (under ~300 changed lines); split ones that aren't;
+- each card is one reviewable diff that fits the Sizing rules; check estimated_lines against the
+  repository and split cards that don't fit;
 - acceptance criteria are concrete and testable; non_goals name tempting extras;
 - test_first is set on cards changing money, stored data or auth/permissions.
 Return verdict "ok" with the plan unchanged if it is sound; otherwise "revise", list each
@@ -241,6 +251,8 @@ You are a worker agent in a multi-agent orchestrator. You own exactly ONE task c
 - If the task is impossible as written (missing access, contradictory requirements),
   report status "blocked" with a precise blocker.
 - Prefer fast, targeted test runs over full suites; don't loop on slow commands.
+- Diffs over the project's size limit are rejected. If a size check says you passed it, stop and
+  report "blocked" with how to split the card; don't trim the work to fit.
 - Before reporting "done", run the checks listed on the card and fix what fails; the
   orchestrator runs exactly those commands next.
 Your final answer must be the structured report."""
@@ -268,11 +280,12 @@ When you can, check behaviour instead of guessing: run the relevant tests or a s
 problems, each with where it is; every blocking finding will be independently verified.
 Set fixable to false only when the approach itself is wrong and starting over is better."""
 
-VALIDATOR_SYSTEM = """You verify one finding from a code review before it can block a change.
-Read the code and, when useful, run tests or a short script (read-only; never edit files or
-run state-changing git commands). Return confirmed=false only if you can show the finding is
-wrong (the criterion is met, the bug can't happen, the change is within the card's scope),
-with the evidence. If it holds, or you can't tell, return confirmed=true."""
+VALIDATOR_SYSTEM = """You verify the blocking findings of a code review before they can block a change.
+Check each numbered finding on its own evidence; one finding being right or wrong says nothing
+about the others. Read the code and, when useful, run tests or a short script (read-only; never
+edit files or run state-changing git commands). For each finding return confirmed=false only if
+you can show it is wrong (the criterion is met, the bug can't happen, the change is within the
+card's scope), with the evidence. If it holds, or you can't tell, return confirmed=true."""
 
 TEST_WRITER_APPEND = """
 You write the acceptance tests for ONE task card BEFORE anyone implements it.
@@ -286,6 +299,24 @@ You write the acceptance tests for ONE task card BEFORE anyone implements it.
   ask questions. Report "blocked" only if the card can't be tested at all.
 - These files will be locked: the implementer can't edit them.
 Your final answer must be the structured report."""
+
+
+def sizing_rules(cfg: Config) -> str:
+    """How big a card may be, from the project's diff gate (planner, critic and triage)."""
+    limit = cfg.max_diff_lines
+    split_at = int(limit * cfg.split_above)
+    return f"""
+
+## Sizing
+The diff gate rejects a card whose change is over {limit} changed lines (lockfiles and generated
+files listed in diff_exclude don't count; tests, docs and committed data do). A card rejected for
+size is thrown away and split, so size cards before work starts:
+- Give every card estimated_lines: the code, tests, docs and committed data its diff will need.
+  Look at the files it touches to estimate; don't guess low.
+- Split any card estimated above {split_at} lines into cards ordered with depends_on.
+- Generated or example data (JSON payloads, fixtures, snapshots, seed data) counts in full. Keep
+  committed examples small and hand-trimmed, and build full data at test time instead.
+- Say in size_notes what dominates the size."""
 
 
 def model_family(model: str) -> str:
@@ -388,10 +419,14 @@ def task_card(t: Task, checks: list[str] | None = None) -> str:
     return card
 
 
-def agent_env() -> dict[str, str]:
+def agent_env(cfg: Config | None = None) -> dict[str, str]:
     """Environment for every agent session. Auto memory is per repository and shared by all
-    worktrees, so parallel agents (and your own sessions) would read each other's notes."""
-    return {"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}
+    worktrees, so parallel agents (and your own sessions) would read each other's notes.
+    The prompt-cache lifetime comes from [agents] cache_ttl."""
+    env = {"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}
+    if cfg is not None:
+        env.update(CACHE_TTLS[cfg.agents.cache_ttl])
+    return env
 
 
 def sandbox_settings(cfg: Config) -> dict | None:
@@ -417,13 +452,14 @@ def sandbox_settings(cfg: Config) -> dict | None:
 @dataclass
 class AgentResult:
     data: dict[str, Any]
-    cost_usd: float
+    cost_usd: float  # the session's running total: a resumed session includes its earlier runs
     ok: bool = True
     error: str = ""
     tokens: int = 0  # input + output + cache tokens across all models in the call
     session_id: str | None = None
     limited: bool = False            # cut off by a usage/rate limit
     resets_at: float | None = None   # when that limit resets (unix seconds), if known
+    model: str = ""                  # the model that did most of the work
 
 
 def _tokens(model_usage: dict | None) -> int:
@@ -432,6 +468,12 @@ def _tokens(model_usage: dict | None) -> int:
         total += sum(int(u.get(k, 0) or 0) for k in
                      ("inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens"))
     return total
+
+
+def _main_model(model_usage: dict | None) -> str:
+    """The model id that used the most tokens (the CLI may also call a small helper model)."""
+    usage = {m: _tokens({m: u}) for m, u in (model_usage or {}).items()}
+    return max(usage, key=usage.get) if usage else ""
 
 
 class Runner(Protocol):
@@ -447,7 +489,7 @@ class Runner(Protocol):
                      work_report: dict[str, Any], gate_log: str, impact: str = "",
                      graph: Path | None = None, note: str = "", model: str | None = None,
                      env: dict | None = None) -> AgentResult: ...
-    async def validate(self, cfg: Config, task: Task, worktree: Path, diff: str, finding: dict,
+    async def validate(self, cfg: Config, task: Task, worktree: Path, diff: str, findings: list[dict],
                        env: dict | None = None) -> AgentResult: ...
     async def triage(self, cfg: Config, task: Task, context: str, cwd: Path,
                      graph: Path | None = None) -> AgentResult: ...
@@ -510,6 +552,7 @@ class ClaudeRunner:
                                resets_at=resets_at, session_id=session_id)
         cost = result.total_cost_usd or 0.0
         tokens = _tokens(result.model_usage)
+        model = _main_model(result.model_usage) or str(getattr(options, "model", "") or "")
         data = result.structured_output
         session_id = result.session_id or session_id
         if result.is_error or not isinstance(data, dict):
@@ -518,8 +561,8 @@ class ClaudeRunner:
             limited = limited or result.api_error_status == 429 or \
                 (result.terminal_reason == "api_error" and looks_like_limit(text))
             return AgentResult({}, cost, ok=False, tokens=tokens, error=text, limited=limited,
-                               resets_at=resets_at, session_id=session_id)
-        return AgentResult(data, cost, tokens=tokens, session_id=session_id)
+                               resets_at=resets_at, session_id=session_id, model=model)
+        return AgentResult(data, cost, tokens=tokens, session_id=session_id, model=model)
 
     async def plan(self, cfg: Config, goal: str, cwd: Path | None = None,
                    graph: Path | None = None) -> AgentResult:
@@ -530,10 +573,10 @@ class ClaudeRunner:
         root = cwd or cfg.repo
         opts = ClaudeAgentOptions(
             cwd=str(root), model=cfg.planner_model,
-            system_prompt=PLANNER_SYSTEM + guide + _context(cfg),
+            system_prompt=PLANNER_SYSTEM + sizing_rules(cfg) + guide + _context(cfg),
             tools=base, allowed_tools=allowed, mcp_servers=servers, strict_mcp_config=True,
             setting_sources=["project"], max_turns=60, session_id=_new_session(),
-            max_budget_usd=cfg.task_budget_usd * 2, env=agent_env(),
+            max_budget_usd=cfg.task_budget_usd * 2, env=agent_env(cfg),
             hooks={"PreToolUse": [HookMatcher(hooks=[make_read_guard(Path(root))])]},
             output_format={"type": "json_schema", "schema": PLAN_SCHEMA},
         )
@@ -545,15 +588,22 @@ class ClaudeRunner:
                         schema: dict, locked: list[str] | None = None, stop_gate: bool = False):
         """Options for an agent that edits files in the worktree (worker, test writer)."""
         from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
-        from .gates import make_stop_gate
+        from .gates import SIZE_TOOLS, make_size_guard, make_stop_gate
         tools = ["Read", "Write", "Edit", "Glob", "Grep", "Bash"]
         servers, allowed, guide = _graph_opts(cfg, graph, tools)
         sandbox = sandbox_settings(cfg)
         hooks = {"PreToolUse": [HookMatcher(hooks=[make_worker_guard(worktree, locked)])]}
+        if cfg.agents.bash_output_max_chars:  # long command output comes back as head + tail
+            hooks["PreToolUse"].append(HookMatcher(matcher="Bash",
+                                                   hooks=[make_output_cap(cfg.agents.bash_output_max_chars)]))
         fast = [g for g in cfg.gates if g.fast]
         if stop_gate and cfg.gates_on_stop and fast:
             hooks["Stop"] = [HookMatcher(hooks=[make_stop_gate(fast, worktree, env=env)],
                                          timeout=sum(g.timeout_s for g in fast) + 30)]
+        if stop_gate and task.base_commit:  # workers: hear about size while there's time to stop
+            guard = make_size_guard(worktree, task.base_commit, cfg.max_diff_lines,
+                                    list(cfg.diff_exclude) + list(locked or []))
+            hooks["PostToolUse"] = [HookMatcher(matcher=SIZE_TOOLS, hooks=[guard], timeout=60)]
         return ClaudeAgentOptions(
             cwd=str(worktree), model=model,
             system_prompt={"type": "preset", "preset": "claude_code",
@@ -562,7 +612,7 @@ class ClaudeRunner:
             mcp_servers=servers, strict_mcp_config=True,
             setting_sources=["project"],  # picks up the repo's CLAUDE.md
             max_turns=cfg.worker_max_turns, max_budget_usd=cfg.task_budget_usd,
-            env={**agent_env(), **(env or {})}, sandbox=sandbox, hooks=hooks,
+            env={**agent_env(cfg), **(env or {})}, sandbox=sandbox, hooks=hooks,
             output_format={"type": "json_schema", "schema": schema},
             resume=task.session_id if (resume and task.session_id) else None,
             session_id=None if (resume and task.session_id) else _new_session(),
@@ -601,7 +651,7 @@ class ClaudeRunner:
             system_prompt=system + (SANDBOX_NOTE if sandbox else "") + guide + _context(cfg),
             tools=base, allowed_tools=allowed, mcp_servers=servers, strict_mcp_config=True,
             setting_sources=["project"], max_turns=max_turns, max_budget_usd=cfg.task_budget_usd,
-            session_id=_new_session(), env={**agent_env(), **(env or {})}, sandbox=sandbox,
+            session_id=_new_session(), env={**agent_env(cfg), **(env or {})}, sandbox=sandbox,
             hooks={"PreToolUse": [HookMatcher(hooks=[guard])]},
             output_format={"type": "json_schema", "schema": schema},
         )
@@ -613,24 +663,30 @@ class ClaudeRunner:
         impact_block = (f"## Impact (from the code graph: code outside this diff that depends on "
                         f"changed symbols; check these still work)\n{impact}\n\n" if impact else "")
         note_block = f"## Context for this review\n{note}\n\n" if note else ""
-        prompt = (f"{task_card(task)}\n\n{note_block}## Worker's report\n```json\n"
+        # the per-round note goes last, so a re-review shares everything before it
+        prompt = (f"{task_card(task)}\n\n## Worker's report\n```json\n"
                   f"{json.dumps(work_report, indent=2)}\n```\n\n"
                   f"## Automated gates\n{gate_log}\n\n{impact_block}## Diff\n```diff\n{diff}\n```\n\n"
-                  "Read surrounding code and run what helps, then give your verdict.")
+                  f"{note_block}Read surrounding code and run what helps, then give your verdict.")
         opts = self._checker_options(cfg, worktree, graph, model or cfg.reviewer_model, REVIEWER_SYSTEM,
                                      REVIEW_SCHEMA, env, max_turns=40)
         return await self._run(prompt, opts, f"{task.id}:review")
 
-    async def validate(self, cfg: Config, task: Task, worktree: Path, diff: str, finding: dict,
+    async def validate(self, cfg: Config, task: Task, worktree: Path, diff: str, findings: list[dict],
                        env: dict | None = None) -> AgentResult:
+        """All of a review's blocking findings in one session (one cold start, not one per
+        finding). The card and diff come first and the findings last, so the prompt's shared
+        part stays the same from one review to the next."""
         what = {"criterion": "Reviewer says this acceptance criterion is NOT met",
                 "issue": "Reviewer reports this blocking problem",
-                "scope": "Reviewer says this is scope creep (outside the card)"}[finding["kind"]]
-        prompt = (f"{task_card(task)}\n\n## Finding to verify\n{what}:\n{finding['text']}\n"
-                  f"({finding.get('detail', '')})\n\n## Diff\n```diff\n{diff}\n```\n\n"
-                  "Verify this one finding, then answer.")
+                "scope": "Reviewer says this is scope creep (outside the card)"}
+        listed = "\n\n".join(f"### Finding {i}\n{what[f['kind']]}:\n{f['text']}\n({f.get('detail', '')})"
+                              for i, f in enumerate(findings, 1))
+        prompt = (f"{task_card(task)}\n\n## Diff\n```diff\n{diff}\n```\n\n"
+                  f"## Findings to verify\n{listed}\n\n"
+                  "Verify each finding, then answer with one verdict per finding number.")
         opts = self._checker_options(cfg, worktree, None, cfg.validator_model, VALIDATOR_SYSTEM,
-                                     VALIDATE_SCHEMA, env, max_turns=25)
+                                     VALIDATE_SCHEMA, env, max_turns=min(15 + 10 * len(findings), 60))
         return await self._run(prompt, opts, f"{task.id}:validate")
 
     async def triage(self, cfg: Config, task: Task, context: str, cwd: Path,
@@ -641,10 +697,10 @@ class ClaudeRunner:
         servers, allowed, guide = _graph_opts(cfg, graph, base)
         opts = ClaudeAgentOptions(
             cwd=str(cwd), model=cfg.planner_model,
-            system_prompt=TRIAGE_SYSTEM + guide + _context(cfg),
+            system_prompt=TRIAGE_SYSTEM + sizing_rules(cfg) + guide + _context(cfg),
             tools=base, allowed_tools=allowed, mcp_servers=servers, strict_mcp_config=True,
             setting_sources=["project"], max_turns=30, session_id=_new_session(),
-            max_budget_usd=cfg.task_budget_usd, env=agent_env(),
+            max_budget_usd=cfg.task_budget_usd, env=agent_env(cfg),
             hooks={"PreToolUse": [HookMatcher(hooks=[make_read_guard(Path(cwd))])]},
             output_format={"type": "json_schema", "schema": TRIAGE_SCHEMA},
         )
@@ -658,10 +714,10 @@ class ClaudeRunner:
         root = cwd or cfg.repo
         opts = ClaudeAgentOptions(
             cwd=str(root), model=cfg.planner_model,
-            system_prompt=CRITIC_SYSTEM + guide + _context(cfg),
+            system_prompt=CRITIC_SYSTEM + sizing_rules(cfg) + guide + _context(cfg),
             tools=base, allowed_tools=allowed, mcp_servers=servers, strict_mcp_config=True,
             setting_sources=["project"], max_turns=40, session_id=_new_session(),
-            max_budget_usd=cfg.task_budget_usd * 2, env=agent_env(),
+            max_budget_usd=cfg.task_budget_usd * 2, env=agent_env(cfg),
             hooks={"PreToolUse": [HookMatcher(hooks=[make_read_guard(Path(root))])]},
             output_format={"type": "json_schema", "schema": CRITIC_SCHEMA},
         )

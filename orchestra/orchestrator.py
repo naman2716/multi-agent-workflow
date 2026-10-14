@@ -293,6 +293,7 @@ class Orchestrator:
     async def _recover(self) -> None:
         """Cards a previous run left running/in review: resume them where possible."""
         for t in self.store.interrupted():
+            self.store.end_session(t.session_id, "interrupted")
             intact = bool(t.worktree and Path(t.worktree).exists() and t.session_id and t.base_commit)
             if intact:
                 at_review = t.status == "review" and self._report_path(t).exists()
@@ -590,6 +591,7 @@ class Orchestrator:
                         return
                     self.store.update(task.id, status="running")
                     continue
+                self.store.end_session(task.session_id, "review_rejected")
                 return await self._fail_attempt(task, feedback)
 
             self.say(task.id, "review approved", "review")
@@ -654,8 +656,9 @@ class Orchestrator:
                 return True
             self.say(task.id, "saved acceptance tests no longer apply; writing them again", "tests")
 
+        started = time.time()
         res = await self.runner.write_tests(cfg, replace(task, session_id=None), wt, graph=graph, env=env)
-        self.store.add_cost(task.id, res.cost_usd, res.tokens)
+        self._spent(task, res, "test_writer", started)
         if not res.ok:
             if res.limited:
                 await self._pause_for_limit(task, res)
@@ -706,8 +709,9 @@ class Orchestrator:
         round_no = 0
         while True:
             task = self.store.get(task.id)
+            started = time.time()
             res = await self.runner.work(cfg, task, wt, graph=graph, resume=message, env=env)
-            self.store.add_cost(task.id, res.cost_usd, res.tokens)
+            self._spent(task, res, "worker", started)
             if res.session_id:
                 self.store.update(task.id, session_id=res.session_id)
             if not res.ok:
@@ -754,6 +758,17 @@ class Orchestrator:
             failures = summarize_failures(results)
             self.say(task.id, f"gates failed (round {round_no + 1}): "
                      f"{', '.join(r.name for r in results if not r.passed)}", "gate")
+            self.store.end_session(res.session_id, "gate_failed")
+            counted = stats.counted(list(cfg.diff_exclude) + list(task.locked_tests))
+            if (any(r.name == "diff_size" and not r.passed for r in results)
+                    and counted > cfg.max_diff_lines * cfg.oversize_triage_factor):
+                # far too big to trim in place, and a fresh attempt would build the same thing
+                self.say(task.id, f"{counted} lines is over {cfg.oversize_triage_factor:g}x the limit "
+                         "→ to triage now, no trim round", "gate")
+                await self._fail_attempt(task, f"{GATE_FIX_PREFIX} The card needs {counted} changed lines, "
+                                         f"over {cfg.oversize_triage_factor:g}x the {cfg.max_diff_lines}-line "
+                                         f"limit; it must be split.\n{failures}", triage_now=True)
+                return None
             if round_no >= FIX_ROUNDS:
                 # same prefix as the fix notes, so the card keeps only this latest gate log
                 await self._fail_attempt(task, f"{GATE_FIX_PREFIX} Still failing after {FIX_ROUNDS} "
@@ -779,10 +794,11 @@ class Orchestrator:
         if task.locked_tests:
             note = (note + "\n" if note else "") + self._tests_note(task)
         model = pick_reviewer_model(cfg, pick_worker_model(cfg, task))
+        started = time.time()
         rev = await self.runner.review(cfg, task, wt, diff, report, gate_log, impact=impact, graph=graph,
                                        note=note, model=model, env=env)
         await self.git.discard_uncommitted(wt)  # whatever the reviewer's commands left behind
-        self.store.add_cost(task.id, rev.cost_usd, rev.tokens)
+        self._spent(task, rev, "reviewer", started)
         if not rev.ok:
             if rev.limited:
                 await self._pause_for_limit(task, rev, stage=REVIEW_STAGE)
@@ -805,28 +821,31 @@ class Orchestrator:
         return approved, verdict, reasons
 
     async def _validate(self, task: Task, wt: Path, diff: str, verdict: dict, env: dict) -> dict | None:
-        """Each blocking finding is checked by a validator; refuted ones are dropped."""
+        """One validator checks the review's blocking findings; refuted ones are dropped. A
+        finding without a clear "refuted" verdict (or a failed validator) stands."""
         findings = blocking_findings(verdict)
         checked = findings[:max(self.cfg.review.max_validations, 0)]
-        # validators that can run tests share the card's env slot (ports, test DB): one at a time
-        gate = asyncio.Semaphore(1 if self.cfg.review.reviewer_shell else 2)
-
-        async def one(f: dict):
-            async with gate:
-                return await self.runner.validate(self.cfg, task, wt, diff, f, env=env)
-        results = await asyncio.gather(*(one(f) for f in checked))
+        if not checked:
+            return verdict
+        started = time.time()
+        r = await self.runner.validate(self.cfg, task, wt, diff, checked, env=env)
         await self.git.discard_uncommitted(wt)
-        refuted, limited = [], None
-        for f, r in zip(checked, results):
-            self.store.add_cost(task.id, r.cost_usd, r.tokens)
-            if r.limited:
-                limited = r
-            elif r.ok and r.data.get("confirmed") is False:
-                refuted.append({**f, "evidence": r.data.get("evidence", "")})
-                self.store.log(task.id, "validate", f"refuted: {f['text'][:200]} — {r.data.get('evidence', '')[:300]}")
-        if limited:
-            await self._pause_for_limit(task, limited, stage=REVIEW_STAGE)
+        self._spent(task, r, "validator", started)
+        if r.limited:
+            await self._pause_for_limit(task, r, stage=REVIEW_STAGE)
             return None
+        verdicts = {}
+        for v in (r.data.get("findings") or []) if r.ok else []:
+            if isinstance(v, dict) and isinstance(v.get("index"), int):
+                verdicts.setdefault(v["index"], v)  # first verdict per finding wins
+        refuted = []
+        for i, f in enumerate(checked, 1):
+            v = verdicts.get(i) or {}
+            if v.get("confirmed") is False:
+                refuted.append({**f, "evidence": v.get("evidence", "")})
+                self.store.log(task.id, "validate", f"refuted: {f['text'][:200]} — {v.get('evidence', '')[:300]}")
+        if not r.ok:
+            self.say(task.id, f"validator failed ({r.error[:120]}); the findings stand", "warn")
         self.say(task.id, f"validated {len(checked)} blocking finding(s): {len(refuted)} refuted", "validate")
         return drop_refuted(verdict, refuted)
 
@@ -894,22 +913,36 @@ class Orchestrator:
         return None
 
     # ------------------------------------------------------------ outcomes
-    async def _fail_attempt(self, task: Task, reason: str, triage: bool = True) -> None:
+    def _spent(self, task: Task, res, role: str, started: float) -> None:
+        """Count a call's spend and record its session's run (role, model, why it ended)."""
+        status = res.data.get("status") if res.ok else None
+        reason = ("usage_limit" if res.limited else "error" if not res.ok
+                  else status if status in ("blocked", "needs_decision") else "done")
+        self.store.add_cost(task.id, res.cost_usd, res.tokens, res.session_id, role=role,
+                            model=getattr(res, "model", "") or None,
+                            attempt=self.store.get(task.id).attempts, started_at=started, end_reason=reason)
+
+    async def _fail_attempt(self, task: Task, reason: str, triage: bool = True,
+                            triage_now: bool = False) -> None:
+        """Attempts used up: triage, else blocked. Otherwise retry. With `triage_now` (the card
+        itself is the problem, e.g. far too big) triage runs before the attempts are used up."""
         task = self.store.get(task.id)
         self.store.add_feedback(task.id, reason)
         await self.git.remove_worktree(task.id, task.branch)
-        if task.attempts >= self.cfg.max_attempts:
+        last = task.attempts >= self.cfg.max_attempts
+        if last or (triage and triage_now):
             self.store.update(task.id, worktree=None, session_id=None)
             handled, note = await self._triage(task, reason) if triage else (False, "")
             if handled:
                 return
-            self.store.update(task.id, status="blocked", worktree=None, session_id=None)
-            self.notify(f"Orchestra: {task.id} blocked", (note or reason)[:300])
-            self.say(task.id, f"blocked after {task.attempts} attempts — needs a human. "
-                     f"Last reason: {reason[:300]}", "blocked")
-        else:
-            self.store.update(task.id, status="pending", worktree=None, session_id=None)
-            self.say(task.id, f"retrying: {reason.splitlines()[0][:200]}", "retry")
+            if last or note:  # attempts used up, or triage itself says a human must decide
+                self.store.update(task.id, status="blocked", worktree=None, session_id=None)
+                self.notify(f"Orchestra: {task.id} blocked", (note or reason)[:300])
+                self.say(task.id, f"blocked after {task.attempts} attempt(s) — needs a human. "
+                         f"Last reason: {reason[:300]}", "blocked")
+                return
+        self.store.update(task.id, status="pending", worktree=None, session_id=None)
+        self.say(task.id, f"retrying: {reason.splitlines()[0][:200]}", "retry")
 
     async def _block(self, task: Task, reason: str) -> None:
         self.store.add_feedback(task.id, reason)
@@ -974,8 +1007,9 @@ class Orchestrator:
         context = self._triage_context(task, reason)
         async with self._triage_lock:  # one shared read-only worktree at the integration head
             cwd = await self.git.detached_worktree("_triage", cfg.integration_branch)
+            started = time.time()
             res = await self.runner.triage(cfg, task, context, cwd=cwd)
-        self.store.add_cost(task.id, res.cost_usd, res.tokens)
+        self._spent(task, res, "triage", started)
         if not res.ok:
             if res.limited:
                 self.limits.pause(res.resets_at)
@@ -1131,7 +1165,8 @@ class Orchestrator:
         dependents = self._dependents(task.id, tasks)
         existing = [t for t in self.store.open_tasks() if t.id != task.id and t.id not in dependents]
         try:
-            new, _ = build_tasks({"tasks": items}, start=len(tasks) + 1, existing=existing)
+            new, notes = build_tasks({"tasks": items}, start=len(tasks) + 1, existing=existing,
+                                     split_at=int(self.cfg.max_diff_lines * self.cfg.split_above))
         except (PlanError, KeyError, TypeError, AttributeError) as e:
             raise TriageRejected(f"its split was invalid ({e})") from None
         if task.files_scope:
@@ -1141,6 +1176,9 @@ class Orchestrator:
                 raise TriageRejected("the split reaches outside the card's files_scope ("
                                      + "; ".join(outside[:3]) + ")")
         ids = [n.id for n in new]
+        for note in notes:
+            if "split threshold" in note:
+                self.say(task.id, f"triage split: {note}", "warn")
         for n in new:
             n.depends_on = list(dict.fromkeys(n.depends_on + task.depends_on))
             n.test_first, n.source, n.triaged = task.test_first, task.source, True
@@ -1214,6 +1252,7 @@ class Orchestrator:
             return False
         self.store.update(task.id, status="pending", resume_note=message,
                           attempts=max(self.store.get(task.id).attempts - 1, 0))
+        self.store.end_session(self.store.get(task.id).session_id, "budget")
         self.say(task.id, f"{self.stop_reason}: will continue this card next run", "limit")
         return True
 

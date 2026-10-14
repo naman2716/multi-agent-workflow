@@ -25,7 +25,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .agents import PLANNER_SYSTEM, REVIEWER_SYSTEM, WORKER_APPEND
+from .agents import PLANNER_SYSTEM, REVIEWER_SYSTEM, WORKER_APPEND, sizing_rules
 from .config import Config
 from .graph import GRAPH_GUIDE, graphify_available
 
@@ -61,6 +61,8 @@ def _plan_format() -> str:
     "files_scope": ["src/exact/path.ts", "src/dir/**"],
     "depends_on": ["other-slug"],
     "complexity": "small | large",
+    "estimated_lines": 250,
+    "size_notes": "what dominates the size",
     "test_first": false,
     "model": "optional override, e.g. opus | sonnet | haiku; omit to use the defaults"
   }],
@@ -81,7 +83,7 @@ def build_files(cfg: Config, graph: bool) -> dict[str, str]:
         "Decomposes a large goal into parallel-safe task cards for Orchestra. Use when asked to "
         "plan or break down a feature before dispatching it.",
         ["Read", "Glob", "Grep", *g_tools], cfg.planner_model,
-        PLANNER_SYSTEM + guide + f"\n\nOutput the plan as JSON in exactly this shape:\n{_plan_format()}")
+        PLANNER_SYSTEM + sizing_rules(cfg) + guide + f"\n\nOutput the plan as JSON in exactly this shape:\n{_plan_format()}")
 
     files[".claude/agents/orchestra-worker.md"] = _agent(
         "orchestra-worker",

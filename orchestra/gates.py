@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import Config, Gate
-from .gitops import DiffStats, matches_any, run
+from .gitops import DiffStats, matches_any, run, working_diff_stats
 
 SECRET_PATTERNS = [
     (re.compile(r"AKIA[0-9A-Z]{16}"), "AWS access key"),
@@ -163,6 +163,36 @@ def find_report(input_data: dict[str, Any], tail_lines: int = 400) -> dict | Non
                     and "status" in inp and "files_changed" in inp:
                 return inp
     return None
+
+
+SIZE_WARN_AT = 0.8
+SIZE_TOOLS = "Write|Edit|MultiEdit|NotebookEdit|Bash"
+
+
+def make_size_guard(worktree: Path, base: str, limit: int, exclude: list[str]):
+    """Agent SDK PostToolUse hook for workers: count the change as the diff_size gate will, and
+    tell the worker once it nears the limit and again once it passes it, so an oversized card
+    stops early (report blocked, get split) instead of being written in full and then trimmed."""
+    state = {"warned": 0.0}
+
+    async def hook(input_data: dict[str, Any], tool_use_id: str | None, context: Any) -> dict[str, Any]:
+        try:
+            counted = (await working_diff_stats(worktree, base)).counted(exclude)
+        except Exception:  # a broken size check must never get in the worker's way
+            return {}
+        if counted > limit and state["warned"] < 1.0:
+            state["warned"] = 1.0
+            msg = (f"Size check: your change is now {counted} changed lines; the orchestrator rejects "
+                   f"more than {limit}. Stop here and don't trim to fit: report status \"blocked\" "
+                   "with the work done so far and how you would split this card into smaller ones.")
+        elif counted > limit * SIZE_WARN_AT and state["warned"] < SIZE_WARN_AT:
+            state["warned"] = SIZE_WARN_AT
+            msg = (f"Size check: your change is {counted} changed lines, near the {limit}-line limit. "
+                   "Finish within it; if the card can't fit, report \"blocked\" with how to split it.")
+        else:
+            return {}
+        return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": msg}}
+    return hook
 
 
 def make_stop_gate(gates: list[Gate], worktree: Path, max_blocks: int = 1, env: dict | None = None):
