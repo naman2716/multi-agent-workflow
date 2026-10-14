@@ -29,3 +29,8 @@ the full command if it passes.
 
 ### Requirement: Locked tests are what gets checked
 For a card with locked acceptance tests, every gate run SHALL use the locked versions of those files.
+
+### Requirement: Renamed files are checked by their real paths
+Diff statistics SHALL list both the old and the new path of a renamed or copied file (never git's
+`old => new` display form), so the scope gate checks each location; a card that moves files needs
+both locations in its `files_scope`.
