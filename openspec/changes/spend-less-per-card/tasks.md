@@ -23,6 +23,12 @@
 - [x] 2.9a README: sizing, validators, budget, [agents] settings, `orchestra usage`
 - [ ] 2.9b README: "Keeping your own session cheap" (not in the approved list; awaiting a decision)
 - [x] 2.10 Spec deltas under `specs/` (orchestration, agents, planning, quality-gates, cli)
+- [x] 2.11 Live smoke test (2026-10-15, throwaway repo, economy profile, $0.04): every cache write
+      was 5-minute (0 one-hour); a 600k-char `python3 noise.py` reached the worker as 8,148 chars with
+      head, tail and the truncation note, inside the sandbox; the size check reached the worker at
+      62/40 lines and it reported blocked without trimming; sessions were recorded with roles and end
+      reasons, and `orchestra usage` used them. Not exercised live: resumed-session cost deltas,
+      the single validator, the oversize-to-triage path, the reviewer note order.
 
 ## Phase 2: measure and close
 - [ ] 3.1 Next comparable wave → `after.md` with `orchestra usage`; compare cost per merged card,
