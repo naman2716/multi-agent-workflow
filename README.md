@@ -299,6 +299,57 @@ Needs the GitHub CLI logged in (`gh auth login`) on the machine that runs Orches
 remote or `gh` it says so and the run still succeeds. `orchestra ship` does the same by hand
 (`--no-wait` to skip CI).
 
+## Commit identity and push credentials
+
+Two separate things decide how agent work shows up on GitHub:
+
+- **Commit identity**: the name and email written into each commit (author and committer).
+  GitHub attributes a commit to your account when that email is a verified address on it (or your
+  `ID+username@users.noreply.github.com` address). Orchestra sets it from `[git] author`:
+  - `"user"` (default): your `git config user.name` / `user.email` for the repo. If either is
+    missing, `orchestra run` stops before it starts and says how to set it; it never falls back
+    to another identity.
+  - `"orchestra"`: `Orchestra <orchestra@local>` (the old behaviour; not linked to any account).
+  - a literal `"Name <email>"`.
+
+  The committer is always the same as the author, so GitHub shows one identity. With
+  `co_author = "Name <email>"` every Orchestra commit also gets a `Co-authored-by:` trailer.
+  If your git config sets `commit.gpgsign`, Orchestra's commits are signed the same way.
+- **Push credentials**: whether you may push and open PRs. `orchestra ship` runs `git push` and
+  `gh` as you, with your existing setup (your git credential helper or SSH key for the push, and
+  `gh auth login` for PRs), with prompts turned off. Orchestra stores no GitHub credentials. To see
+  what's used on your machine:
+
+  ```bash
+  git remote get-url origin                          # https:// (credential helper) or git@ (SSH key)
+  git config --show-origin --get-all credential.helper
+  gh auth status
+  ```
+
+**Commit hooks.** By default Orchestra commits with `--no-verify`, so the repo's `pre-commit` and
+`commit-msg` hooks don't run (`post-commit`, `post-checkout` and, on ship, `pre-push` always run).
+With `[git] run_hooks = true`, commits of agent work (the worker's change, its conflict
+resolutions, the test writer's tests) run them. A failing hook goes back to the worker like a
+failed gate (`[gate:git hooks]`, within the usual fix rounds), and whatever the hook changed
+(formatter fixes) stays in the worktree. Orchestra's own re-commits of work that already passed
+(the squash to one commit, locked-test handling, a merge that applied cleanly) still skip hooks.
+Only installed hooks run: a `.pre-commit-config.yaml` in the repo does nothing until someone runs
+`pre-commit install` (once, in your checkout; worktrees share its hooks). Run
+`pre-commit install --install-hooks` so the first card doesn't build the hook environments.
+
+**Fixing authors on an unpushed integration branch.** Existing commits aren't changed. To
+re-author them yourself, first make sure `orchestra status` shows nothing running, in review or
+waiting (rewriting changes the commits in-flight cards are based on), then:
+
+```bash
+git log --format='%h %an <%ae>' main..orchestra/integration   # what you'd change
+git rebase -r --exec 'git commit --amend --no-edit --no-verify --reset-author' main orchestra/integration
+git checkout -                                                 # back to your branch
+```
+
+`--reset-author` uses your current git config. Don't do this after the branch is pushed unless
+you mean to force-push it.
+
 ## Answer from your phone (ntfy)
 
 ```bash
