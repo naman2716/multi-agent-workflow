@@ -655,7 +655,7 @@ class Orchestrator:
             self.say(task.id, "saved acceptance tests no longer apply; writing them again", "tests")
 
         res = await self.runner.write_tests(cfg, replace(task, session_id=None), wt, graph=graph, env=env)
-        self.store.add_cost(task.id, res.cost_usd, res.tokens)
+        self.store.add_cost(task.id, res.cost_usd, res.tokens, res.session_id)
         if not res.ok:
             if res.limited:
                 await self._pause_for_limit(task, res)
@@ -707,7 +707,7 @@ class Orchestrator:
         while True:
             task = self.store.get(task.id)
             res = await self.runner.work(cfg, task, wt, graph=graph, resume=message, env=env)
-            self.store.add_cost(task.id, res.cost_usd, res.tokens)
+            self.store.add_cost(task.id, res.cost_usd, res.tokens, res.session_id)
             if res.session_id:
                 self.store.update(task.id, session_id=res.session_id)
             if not res.ok:
@@ -782,7 +782,7 @@ class Orchestrator:
         rev = await self.runner.review(cfg, task, wt, diff, report, gate_log, impact=impact, graph=graph,
                                        note=note, model=model, env=env)
         await self.git.discard_uncommitted(wt)  # whatever the reviewer's commands left behind
-        self.store.add_cost(task.id, rev.cost_usd, rev.tokens)
+        self.store.add_cost(task.id, rev.cost_usd, rev.tokens, rev.session_id)
         if not rev.ok:
             if rev.limited:
                 await self._pause_for_limit(task, rev, stage=REVIEW_STAGE)
@@ -818,7 +818,7 @@ class Orchestrator:
         await self.git.discard_uncommitted(wt)
         refuted, limited = [], None
         for f, r in zip(checked, results):
-            self.store.add_cost(task.id, r.cost_usd, r.tokens)
+            self.store.add_cost(task.id, r.cost_usd, r.tokens, r.session_id)
             if r.limited:
                 limited = r
             elif r.ok and r.data.get("confirmed") is False:
@@ -975,7 +975,7 @@ class Orchestrator:
         async with self._triage_lock:  # one shared read-only worktree at the integration head
             cwd = await self.git.detached_worktree("_triage", cfg.integration_branch)
             res = await self.runner.triage(cfg, task, context, cwd=cwd)
-        self.store.add_cost(task.id, res.cost_usd, res.tokens)
+        self.store.add_cost(task.id, res.cost_usd, res.tokens, res.session_id)
         if not res.ok:
             if res.limited:
                 self.limits.pause(res.resets_at)

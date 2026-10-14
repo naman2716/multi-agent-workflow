@@ -57,6 +57,12 @@ CREATE TABLE IF NOT EXISTS events (
     at        REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id    TEXT PRIMARY KEY,
+    task_id       TEXT,
+    cost_usd      REAL NOT NULL DEFAULT 0,     -- the session's running total as last reported
+    tokens        INTEGER NOT NULL DEFAULT 0
+);
 """
 MIGRATIONS = [  # columns added after v0.1; applied idempotently
     ("tokens", "INTEGER NOT NULL DEFAULT 0"),
@@ -251,10 +257,24 @@ class Store:
         t = self.get(task_id)
         self.update(task_id, feedback=t.feedback + [note])
 
-    def add_cost(self, task_id: str, usd: float, tokens: int = 0) -> None:
+    def add_cost(self, task_id: str, usd: float, tokens: int = 0, session_id: str | None = None) -> None:
+        """Add one agent call's spend to the card. A resumed session reports its running total
+        (everything since the session began), so for a known session only the part since its last
+        report is added; a run that was cut off before reporting is picked up by the next one."""
+        usd, tokens = usd or 0.0, tokens or 0
         with self._lock:
+            if session_id:
+                row = self.conn.execute("SELECT cost_usd, tokens FROM sessions WHERE session_id=?",
+                                        (session_id,)).fetchone()
+                seen_usd, seen_tok = (row[0], row[1]) if row else (0.0, 0)
+                self.conn.execute(
+                    "INSERT INTO sessions (session_id, task_id, cost_usd, tokens) VALUES (?,?,?,?) "
+                    "ON CONFLICT(session_id) DO UPDATE SET task_id=excluded.task_id, "
+                    "cost_usd=excluded.cost_usd, tokens=excluded.tokens",
+                    (session_id, task_id, max(usd, seen_usd), max(tokens, seen_tok)))
+                usd, tokens = max(usd - seen_usd, 0.0), max(tokens - seen_tok, 0)
             self.conn.execute("UPDATE tasks SET cost_usd=cost_usd+?, tokens=tokens+? WHERE id=?",
-                              (usd or 0.0, tokens or 0, task_id))
+                              (usd, tokens, task_id))
 
     def interrupted(self) -> list[Task]:
         """Tasks a previous run left 'running'/'review' (it crashed or was stopped)."""

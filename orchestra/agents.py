@@ -417,7 +417,7 @@ def sandbox_settings(cfg: Config) -> dict | None:
 @dataclass
 class AgentResult:
     data: dict[str, Any]
-    cost_usd: float
+    cost_usd: float  # the session's running total: a resumed session includes its earlier runs
     ok: bool = True
     error: str = ""
     tokens: int = 0  # input + output + cache tokens across all models in the call
