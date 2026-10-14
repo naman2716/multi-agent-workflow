@@ -392,5 +392,91 @@ class SessionRecords(Base):
         self.assertRegex(out.getvalue(), r"validator\s+opus-5-5\s+abcdef12 .* 1 run\(s\)  \$0.42  done")
 
 
+SHELLS = [sh_ for sh_ in ("/bin/bash", "/bin/zsh") if Path(sh_).exists()]
+
+
+class BashOutputCap(unittest.TestCase):
+    def run_sh(self, script, shell, cwd):
+        import subprocess
+        return subprocess.run([shell, "-c", script], cwd=cwd, capture_output=True, text=True)
+
+    def test_long_output_keeps_head_and_tail_with_a_note(self):
+        from orchestra.guards import cap_command
+        noisy = ("python3 -c \"print('collected 40 items'); print('x' * 30000); "
+                 "print('FAILED tests/test_a.py::test_fee - assert 9 == 10'); print('=== 1 failed, 39 passed ===')\"; "
+                 "(exit 1)")
+        for shell in SHELLS:
+            with tempfile.TemporaryDirectory() as d:
+                r = self.run_sh(cap_command(noisy, 8000), shell, d)
+                self.assertEqual(r.returncode, 1, shell)
+                self.assertTrue(r.stdout.startswith("collected 40 items"), shell)
+                self.assertIn("FAILED tests/test_a.py::test_fee", r.stdout)
+                self.assertIn("=== 1 failed, 39 passed ===", r.stdout)
+                self.assertRegex(r.stdout, r"\[truncated \d+ chars: the middle of this output was cut")
+                self.assertLess(len(r.stdout), 8400)
+                self.assertEqual(list(Path(d).iterdir()), [])
+
+    def test_short_output_cd_heredoc_and_exit_behave_as_before(self):
+        from orchestra.guards import cap_command
+        for shell in SHELLS:
+            with tempfile.TemporaryDirectory() as d:
+                (Path(d) / "sub").mkdir()
+                r = self.run_sh(cap_command("echo hi >&2; cd sub", 8000) + "\npwd", shell, d)
+                self.assertEqual(r.stdout.splitlines()[0], "hi", shell)     # stderr shown too
+                self.assertTrue(r.stdout.strip().endswith("/sub"), shell)   # cd sticks: same shell
+                r = self.run_sh(cap_command("cat <<'EOF'\nline $HOME\nEOF", 8000), shell, d)
+                self.assertEqual(r.stdout, "line $HOME\n", shell)
+                r = self.run_sh(cap_command("echo before; exit 4", 8000), shell, d)
+                self.assertEqual((r.returncode, r.stdout), (4, "before\n"), shell)
+                r = self.run_sh(cap_command("false", 8000) + "\necho rc=$?", shell, d)
+                self.assertEqual(r.stdout, "rc=1\n", shell)
+
+    def test_a_killed_command_still_shows_its_output_so_far(self):
+        import os
+        import signal
+        import subprocess
+        import time
+        from orchestra.guards import cap_command
+        for shell in SHELLS:
+            with tempfile.TemporaryDirectory() as d:
+                proc = subprocess.Popen([shell, "-c", cap_command("echo partial; sleep 30", 8000)], cwd=d,
+                                        stdout=subprocess.PIPE, text=True, start_new_session=True,
+                                        env={**os.environ, "TMPDIR": d})
+                time.sleep(1)
+                os.killpg(proc.pid, signal.SIGTERM)  # what a tool timeout does to the command's tree
+                out, _ = proc.communicate(timeout=10)
+                self.assertIn("partial", out, shell)
+                self.assertEqual(proc.returncode, 143, shell)
+                self.assertEqual([f for f in Path(d).iterdir() if f.name.startswith("orchestra-out")], [])
+
+    def test_hook_rewrites_foreground_bash_only(self):
+        from orchestra.guards import make_output_cap
+        hook = make_output_cap(8000)
+        out = asyncio.run(hook({"tool_name": "Bash", "tool_input": {"command": "pytest", "timeout": 5}}, None, None))
+        new = out["hookSpecificOutput"]["updatedInput"]
+        self.assertEqual(new["timeout"], 5)
+        self.assertIn("pytest", new["command"])
+        self.assertIn("__oc_show", new["command"])
+        self.assertEqual(asyncio.run(hook({"tool_name": "Bash", "tool_input": {
+            "command": "npm run dev", "run_in_background": True}}, None, None)), {})
+        self.assertEqual(asyncio.run(hook({"tool_name": "Read", "tool_input": {"file_path": "x"}}, None, None)), {})
+        self.assertEqual(asyncio.run(hook({"tool_name": "Bash", "tool_input": {"command": new["command"]}},
+                                          None, None)), {})               # never wrapped twice
+
+    def test_workers_get_it_by_default_and_it_can_be_turned_off(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg, r, task = Config(repo=Path(d)), CapturingRunner(), Task(id="T1", title="t", spec="s")
+            self.assertEqual(cfg.agents.bash_output_max_chars, 8000)
+            asyncio.run(r.work(cfg, task, Path(d)))
+            self.assertEqual([m.matcher for m in r.options.hooks["PreToolUse"]], [None, "Bash"])
+            asyncio.run(r.review(cfg, task, Path(d), "diff", {}, "log"))
+            self.assertEqual(len(r.options.hooks["PreToolUse"]), 1)       # reviewers unchanged
+            cfg.agents.bash_output_max_chars = 0
+            asyncio.run(r.work(cfg, task, Path(d)))
+            self.assertEqual(len(r.options.hooks["PreToolUse"]), 1)
+            (Path(d) / "orchestra.toml").write_text("[agents]\nbash_output_max_chars = 12000\n")
+            self.assertEqual(Config.load(Path(d)).agents.bash_output_max_chars, 12000)
+
+
 if __name__ == "__main__":
     unittest.main()

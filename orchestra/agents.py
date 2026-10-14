@@ -22,7 +22,7 @@ from typing import Any, Callable, Protocol
 from .config import CACHE_TTLS, Config
 from .graph import GRAPH_GUIDE, mcp_tool_names
 from .limits import LimitSignal, looks_like_limit
-from .guards import make_read_guard, make_reviewer_guard, make_worker_guard
+from .guards import make_output_cap, make_read_guard, make_reviewer_guard, make_worker_guard
 from .store import Task
 
 # ---------------------------------------------------------------- schemas
@@ -593,6 +593,9 @@ class ClaudeRunner:
         servers, allowed, guide = _graph_opts(cfg, graph, tools)
         sandbox = sandbox_settings(cfg)
         hooks = {"PreToolUse": [HookMatcher(hooks=[make_worker_guard(worktree, locked)])]}
+        if cfg.agents.bash_output_max_chars:  # long command output comes back as head + tail
+            hooks["PreToolUse"].append(HookMatcher(matcher="Bash",
+                                                   hooks=[make_output_cap(cfg.agents.bash_output_max_chars)]))
         fast = [g for g in cfg.gates if g.fast]
         if stop_gate and cfg.gates_on_stop and fast:
             hooks["Stop"] = [HookMatcher(hooks=[make_stop_gate(fast, worktree, env=env)],

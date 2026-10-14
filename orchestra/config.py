@@ -103,6 +103,9 @@ class AgentSettings:
     # Prompt-cache lifetime. Writes cost 1.25x input for 5 minutes and 2x for 1 hour; agent turns
     # rarely sit idle over 5 minutes, so "5m" is cheaper. "auto" leaves it to the CLI.
     cache_ttl: str = "5m"
+    # Workers' and test writers' Bash output above this many chars comes back as its head and
+    # tail with a "[truncated N chars]" note (0 = off; the CLI then keeps only the first 30000).
+    bash_output_max_chars: int = 8000
 
     def __post_init__(self):
         if self.cache_ttl not in CACHE_TTLS:
@@ -452,6 +455,7 @@ critic = true              # a critic agent checks each plan and returns a corre
 
 [agents]
 cache_ttl = "5m"           # prompt-cache lifetime for agent sessions: "5m" (cheaper writes), "1h" or "auto"
+bash_output_max_chars = 8000  # longer Bash output reaches workers as head + tail (0 = off)
 
 [sandbox]
 # Worker shell commands run in Claude Code's OS sandbox (Seatbelt on macOS): writes only in
