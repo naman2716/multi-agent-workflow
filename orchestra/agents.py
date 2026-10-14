@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
-from .config import Config
+from .config import CACHE_TTLS, Config
 from .graph import GRAPH_GUIDE, mcp_tool_names
 from .limits import LimitSignal, looks_like_limit
 from .guards import make_read_guard, make_reviewer_guard, make_worker_guard
@@ -410,10 +410,14 @@ def task_card(t: Task, checks: list[str] | None = None) -> str:
     return card
 
 
-def agent_env() -> dict[str, str]:
+def agent_env(cfg: Config | None = None) -> dict[str, str]:
     """Environment for every agent session. Auto memory is per repository and shared by all
-    worktrees, so parallel agents (and your own sessions) would read each other's notes."""
-    return {"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}
+    worktrees, so parallel agents (and your own sessions) would read each other's notes.
+    The prompt-cache lifetime comes from [agents] cache_ttl."""
+    env = {"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}
+    if cfg is not None:
+        env.update(CACHE_TTLS[cfg.agents.cache_ttl])
+    return env
 
 
 def sandbox_settings(cfg: Config) -> dict | None:
@@ -555,7 +559,7 @@ class ClaudeRunner:
             system_prompt=PLANNER_SYSTEM + sizing_rules(cfg) + guide + _context(cfg),
             tools=base, allowed_tools=allowed, mcp_servers=servers, strict_mcp_config=True,
             setting_sources=["project"], max_turns=60, session_id=_new_session(),
-            max_budget_usd=cfg.task_budget_usd * 2, env=agent_env(),
+            max_budget_usd=cfg.task_budget_usd * 2, env=agent_env(cfg),
             hooks={"PreToolUse": [HookMatcher(hooks=[make_read_guard(Path(root))])]},
             output_format={"type": "json_schema", "schema": PLAN_SCHEMA},
         )
@@ -584,7 +588,7 @@ class ClaudeRunner:
             mcp_servers=servers, strict_mcp_config=True,
             setting_sources=["project"],  # picks up the repo's CLAUDE.md
             max_turns=cfg.worker_max_turns, max_budget_usd=cfg.task_budget_usd,
-            env={**agent_env(), **(env or {})}, sandbox=sandbox, hooks=hooks,
+            env={**agent_env(cfg), **(env or {})}, sandbox=sandbox, hooks=hooks,
             output_format={"type": "json_schema", "schema": schema},
             resume=task.session_id if (resume and task.session_id) else None,
             session_id=None if (resume and task.session_id) else _new_session(),
@@ -623,7 +627,7 @@ class ClaudeRunner:
             system_prompt=system + (SANDBOX_NOTE if sandbox else "") + guide + _context(cfg),
             tools=base, allowed_tools=allowed, mcp_servers=servers, strict_mcp_config=True,
             setting_sources=["project"], max_turns=max_turns, max_budget_usd=cfg.task_budget_usd,
-            session_id=_new_session(), env={**agent_env(), **(env or {})}, sandbox=sandbox,
+            session_id=_new_session(), env={**agent_env(cfg), **(env or {})}, sandbox=sandbox,
             hooks={"PreToolUse": [HookMatcher(hooks=[guard])]},
             output_format={"type": "json_schema", "schema": schema},
         )
@@ -666,7 +670,7 @@ class ClaudeRunner:
             system_prompt=TRIAGE_SYSTEM + sizing_rules(cfg) + guide + _context(cfg),
             tools=base, allowed_tools=allowed, mcp_servers=servers, strict_mcp_config=True,
             setting_sources=["project"], max_turns=30, session_id=_new_session(),
-            max_budget_usd=cfg.task_budget_usd, env=agent_env(),
+            max_budget_usd=cfg.task_budget_usd, env=agent_env(cfg),
             hooks={"PreToolUse": [HookMatcher(hooks=[make_read_guard(Path(cwd))])]},
             output_format={"type": "json_schema", "schema": TRIAGE_SCHEMA},
         )
@@ -683,7 +687,7 @@ class ClaudeRunner:
             system_prompt=CRITIC_SYSTEM + sizing_rules(cfg) + guide + _context(cfg),
             tools=base, allowed_tools=allowed, mcp_servers=servers, strict_mcp_config=True,
             setting_sources=["project"], max_turns=40, session_id=_new_session(),
-            max_budget_usd=cfg.task_budget_usd * 2, env=agent_env(),
+            max_budget_usd=cfg.task_budget_usd * 2, env=agent_env(cfg),
             hooks={"PreToolUse": [HookMatcher(hooks=[make_read_guard(Path(root))])]},
             output_format={"type": "json_schema", "schema": CRITIC_SCHEMA},
         )

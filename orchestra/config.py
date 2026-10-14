@@ -94,6 +94,21 @@ class Planning:
     critic: bool = True          # a critic agent reviews every plan and returns a corrected one
 
 
+CACHE_TTLS = {"5m": {"FORCE_PROMPT_CACHING_5M": "1"}, "1h": {"ENABLE_PROMPT_CACHING_1H": "1"}, "auto": {}}
+
+
+@dataclass
+class AgentSettings:
+    """How agent sessions run (passed to the Claude Code CLI behind each one)."""
+    # Prompt-cache lifetime. Writes cost 1.25x input for 5 minutes and 2x for 1 hour; agent turns
+    # rarely sit idle over 5 minutes, so "5m" is cheaper. "auto" leaves it to the CLI.
+    cache_ttl: str = "5m"
+
+    def __post_init__(self):
+        if self.cache_ttl not in CACHE_TTLS:
+            raise ValueError(f"[agents] cache_ttl must be one of {list(CACHE_TTLS)}, not {self.cache_ttl!r}")
+
+
 @dataclass
 class Autonomy:
     """Self-healing: a triage agent looks at a card before it is blocked."""
@@ -189,6 +204,7 @@ class Config:
     decision_wait_minutes: float = 60  # without a terminal, keep running this long for answers
     notify_cmd: str = ""  # shell command run with $ORCHESTRA_TITLE / $ORCHESTRA_MESSAGE
     autonomy: Autonomy = field(default_factory=Autonomy)
+    agents: AgentSettings = field(default_factory=AgentSettings)
     ship: Ship = field(default_factory=Ship)
     ntfy: NtfySettings = field(default_factory=NtfySettings)
     linear: LinearSettings = field(default_factory=LinearSettings)
@@ -267,6 +283,7 @@ class Config:
             ask_in_terminal=o.get("ask_in_terminal", True),
             decision_wait_minutes=o.get("decision_wait_minutes", 60),
             autonomy=section(Autonomy, "autonomy"),
+            agents=section(AgentSettings, "agents"),
             ship=section(Ship, "ship"),
             ntfy=_with_saved_topics(section(NtfySettings, "ntfy"),
                                     repo / o.get("state_dir", ".orchestra") / NTFY_TOPICS_FILE),
@@ -429,6 +446,9 @@ port_span = 100
 
 [planning]
 critic = true              # a critic agent checks each plan and returns a corrected one
+
+[agents]
+cache_ttl = "5m"           # prompt-cache lifetime for agent sessions: "5m" (cheaper writes), "1h" or "auto"
 
 [sandbox]
 # Worker shell commands run in Claude Code's OS sandbox (Seatbelt on macOS): writes only in

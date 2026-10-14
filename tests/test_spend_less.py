@@ -8,8 +8,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from orchestra.agents import PLAN_SCHEMA, TRIAGE_SCHEMA, AgentResult, ClaudeRunner, sizing_rules  # noqa: E402
-from orchestra.config import Config  # noqa: E402
+from orchestra.agents import (PLAN_SCHEMA, TRIAGE_SCHEMA, AgentResult, ClaudeRunner, agent_env,  # noqa: E402
+                              sizing_rules)
+from orchestra.config import AgentSettings, Config  # noqa: E402
 from orchestra.harness import build_files  # noqa: E402
 from orchestra.planning import build_tasks, render_plan  # noqa: E402
 from orchestra.store import Store, Task  # noqa: E402
@@ -128,6 +129,46 @@ class CardSizing(unittest.TestCase):
         tasks, _ = build_tasks({"tasks": [item("a", 250)]})
         store.add_task(tasks[0])
         self.assertEqual(store.get("T01").estimated_lines, 250)
+
+
+class CacheTTL(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_five_minutes_by_default_and_configurable(self):
+        cfg = Config(repo=self.root)
+        self.assertEqual(agent_env(cfg), {"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1", "FORCE_PROMPT_CACHING_5M": "1"})
+        cfg.agents.cache_ttl = "1h"
+        self.assertEqual(agent_env(cfg)["ENABLE_PROMPT_CACHING_1H"], "1")
+        self.assertNotIn("FORCE_PROMPT_CACHING_5M", agent_env(cfg))
+        cfg.agents.cache_ttl = "auto"
+        self.assertEqual(agent_env(cfg), {"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"})
+        with self.assertRaises(ValueError):
+            AgentSettings(cache_ttl="10m")
+
+    def test_read_from_orchestra_toml(self):
+        (self.root / "orchestra.toml").write_text('[agents]\ncache_ttl = "1h"\n')
+        self.assertEqual(Config.load(self.root).agents.cache_ttl, "1h")
+        (self.root / "orchestra.toml").write_text("")
+        self.assertEqual(Config.load(self.root).agents.cache_ttl, "5m")
+
+    def test_every_role_gets_it(self):
+        cfg, r = Config(repo=self.root), CapturingRunner()
+        task = Task(id="T1", title="t", spec="s")
+        calls = {"planner": lambda: r.plan(cfg, "g"), "critic": lambda: r.critique_plan(cfg, "g", {"tasks": []}),
+                 "triage": lambda: r.triage(cfg, task, "ctx", self.root),
+                 "worker": lambda: r.work(cfg, task, self.root, env={"SLOT": "1"}),
+                 "test writer": lambda: r.write_tests(cfg, task, self.root),
+                 "reviewer": lambda: r.review(cfg, task, self.root, "diff", {}, "log"),
+                 "validator": lambda: r.validate(cfg, task, self.root, "diff", {"kind": "issue", "text": "x"})}
+        for role, call in calls.items():
+            asyncio.run(call())
+            self.assertEqual(r.options.env.get("FORCE_PROMPT_CACHING_5M"), "1", role)
+        self.assertEqual(r.options.env.get("CLAUDE_CODE_DISABLE_AUTO_MEMORY"), "1")
 
 
 if __name__ == "__main__":
