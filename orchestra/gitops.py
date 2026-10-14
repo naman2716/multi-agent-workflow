@@ -149,10 +149,21 @@ class Git:
         await git(wt, "clean", "-fdq")
 
     async def diff_stats(self, wt: Path, since: str) -> DiffStats:
-        out = await git(wt, "diff", "--numstat", f"{since}...HEAD")
+        # -z gives real paths. A rename is "<a>\t<r>\t\0<old>\0<new>\0", not "old => new".
+        out = await git(wt, "diff", "--numstat", "-z", f"{since}...HEAD")
         files, added, removed, per_file = [], 0, 0, {}
-        for line in out.splitlines():
-            a, r, f = line.split("\t", 2)
+        parts = out.split("\0")
+        i = 0
+        while i < len(parts):
+            rec = parts[i]
+            i += 1
+            if not rec:
+                continue
+            a, r, f = rec.split("\t", 2)
+            if f == "":  # rename or copy: next two fields are old and new paths
+                old, f = parts[i], parts[i + 1]
+                i += 2
+                files.append(old)  # the old path is edited (deleted) too
             files.append(f)
             na, nr = (int(a) if a.isdigit() else 0), (int(r) if r.isdigit() else 0)
             added, removed = added + na, removed + nr
