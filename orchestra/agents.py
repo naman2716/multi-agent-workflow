@@ -245,6 +245,8 @@ You are a worker agent in a multi-agent orchestrator. You own exactly ONE task c
 - If the task is impossible as written (missing access, contradictory requirements),
   report status "blocked" with a precise blocker.
 - Prefer fast, targeted test runs over full suites; don't loop on slow commands.
+- Diffs over the project's size limit are rejected. If a size check says you passed it, stop and
+  report "blocked" with how to split the card; don't trim the work to fit.
 - Before reporting "done", run the checks listed on the card and fix what fails; the
   orchestrator runs exactly those commands next.
 Your final answer must be the structured report."""
@@ -571,7 +573,7 @@ class ClaudeRunner:
                         schema: dict, locked: list[str] | None = None, stop_gate: bool = False):
         """Options for an agent that edits files in the worktree (worker, test writer)."""
         from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
-        from .gates import make_stop_gate
+        from .gates import SIZE_TOOLS, make_size_guard, make_stop_gate
         tools = ["Read", "Write", "Edit", "Glob", "Grep", "Bash"]
         servers, allowed, guide = _graph_opts(cfg, graph, tools)
         sandbox = sandbox_settings(cfg)
@@ -580,6 +582,10 @@ class ClaudeRunner:
         if stop_gate and cfg.gates_on_stop and fast:
             hooks["Stop"] = [HookMatcher(hooks=[make_stop_gate(fast, worktree, env=env)],
                                          timeout=sum(g.timeout_s for g in fast) + 30)]
+        if stop_gate and task.base_commit:  # workers: hear about size while there's time to stop
+            guard = make_size_guard(worktree, task.base_commit, cfg.max_diff_lines,
+                                    list(cfg.diff_exclude) + list(locked or []))
+            hooks["PostToolUse"] = [HookMatcher(matcher=SIZE_TOOLS, hooks=[guard], timeout=60)]
         return ClaudeAgentOptions(
             cwd=str(worktree), model=model,
             system_prompt={"type": "preset", "preset": "claude_code",

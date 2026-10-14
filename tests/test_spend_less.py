@@ -14,7 +14,10 @@ from orchestra.config import AgentSettings, Config  # noqa: E402
 from orchestra.harness import build_files  # noqa: E402
 from orchestra.planning import build_tasks, render_plan  # noqa: E402
 from orchestra.store import Store, Task  # noqa: E402
-from tests.test_orchestra import Base, FakeRunner, done  # noqa: E402
+from orchestra.gates import make_size_guard  # noqa: E402
+from tests.test_orchestra import Base, FakeRunner, done, sh  # noqa: E402
+from tests.test_keep_good_work import sess  # noqa: E402
+from tests.test_run_without_you import TriageRunner  # noqa: E402
 
 
 class CapturingRunner(ClaudeRunner):
@@ -169,6 +172,76 @@ class CacheTTL(unittest.TestCase):
             asyncio.run(call())
             self.assertEqual(r.options.env.get("FORCE_PROMPT_CACHING_5M"), "1", role)
         self.assertEqual(r.options.env.get("CLAUDE_CODE_DISABLE_AUTO_MEMORY"), "1")
+
+
+def lines(n):
+    return "".join(f"x{i} = {i}\n" for i in range(n))
+
+
+class OversizeStopsEarly(Base):
+    def guard(self, limit=100, exclude=()):
+        base = sh("git rev-parse HEAD", self.repo).strip()
+        hook = make_size_guard(self.repo, base, limit, list(exclude))
+        return lambda: asyncio.run(hook({}, None, None)).get("hookSpecificOutput", {}).get("additionalContext")
+
+    def test_size_check_warns_near_and_over_the_limit_once_each(self):
+        check = self.guard(limit=100, exclude=["*.lock"])
+        (self.repo / "big.lock").write_text(lines(500))          # excluded, like the gate
+        (self.repo / "new.py").write_text(lines(50))             # untracked new file counts
+        self.assertIsNone(check())
+        (self.repo / "calc.py").write_text(lines(35))            # tracked edit: 35 added + 2 removed
+        msg = check()
+        self.assertIn("near the 100-line limit", msg)
+        self.assertIsNone(check())                               # not repeated
+        (self.repo / "more.py").write_text(lines(30))
+        msg = check()
+        self.assertIn("117 changed lines", msg)
+        self.assertIn('report status "blocked"', msg)
+        self.assertIsNone(check())
+        untracked = {l[3:] for l in sh("git status --porcelain", self.repo).splitlines() if l.startswith("??")}
+        self.assertTrue({"big.lock", "new.py", "more.py"} <= untracked, "worktree index untouched")
+        self.assertEqual(sh("git diff --cached --name-only", self.repo), "")
+
+    def test_size_check_never_breaks_the_worker(self):
+        hook = make_size_guard(self.repo, "not-a-commit", 10, [])
+        self.assertEqual(asyncio.run(hook({}, None, None)), {})
+
+    def test_worker_sessions_get_the_size_check(self):
+        r, task = CapturingRunner(), Task(id="T1", title="t", spec="s", base_commit="abc")
+        asyncio.run(r.work(self.cfg, task, self.repo))
+        (matcher,) = r.options.hooks["PostToolUse"]
+        self.assertIn("Write", matcher.matcher)
+        self.assertIn("Bash", matcher.matcher)
+        asyncio.run(r.write_tests(self.cfg, task, self.repo))
+        self.assertNotIn("PostToolUse", r.options.hooks)          # test writers aren't size-checked
+
+    def run_oversized(self, n_lines):
+        self.cfg.max_diff_lines = 100
+        self.add("T01", ["big.py"])
+        runner = TriageRunner({"T01": [sess(done(big__py=lines(n_lines)))]},
+                              triage={"T01": {"action": "human", "note_for_human": "split it"}})
+        self.run_orch(runner)
+        return runner
+
+    def test_far_oversized_diff_goes_straight_to_triage(self):
+        runner = self.run_oversized(300)                         # 3x the limit
+        self.assertEqual(runner.calls["T01"], 1, "no trim round, no second attempt")
+        self.assertEqual(runner.triage_calls.get("T01"), 1)
+        t = self.store.get("T01")
+        self.assertEqual((t.status, t.attempts), ("blocked", 1))  # triage said a human must decide
+        self.assertTrue(any("must be split" in f for f in t.feedback))
+
+    def test_oversized_diff_without_triage_retries_as_before(self):
+        self.cfg.autonomy.triage = False
+        runner = self.run_oversized(300)
+        self.assertEqual(runner.calls["T01"], 3)
+        self.assertEqual(runner.resumes["T01"], [None, None, None], "no trim rounds")
+        self.assertEqual(self.store.get("T01").status, "blocked")
+
+    def test_slightly_oversized_diff_still_gets_a_trim_round(self):
+        runner = self.run_oversized(120)                         # 1.2x the limit
+        self.assertGreaterEqual(runner.calls["T01"], 2)
+        self.assertIn("failed automated checks", runner.resumes["T01"][1] or "")
 
 
 if __name__ == "__main__":

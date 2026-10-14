@@ -754,6 +754,16 @@ class Orchestrator:
             failures = summarize_failures(results)
             self.say(task.id, f"gates failed (round {round_no + 1}): "
                      f"{', '.join(r.name for r in results if not r.passed)}", "gate")
+            counted = stats.counted(list(cfg.diff_exclude) + list(task.locked_tests))
+            if (any(r.name == "diff_size" and not r.passed for r in results)
+                    and counted > cfg.max_diff_lines * cfg.oversize_triage_factor):
+                # far too big to trim in place, and a fresh attempt would build the same thing
+                self.say(task.id, f"{counted} lines is over {cfg.oversize_triage_factor:g}x the limit "
+                         "→ to triage now, no trim round", "gate")
+                await self._fail_attempt(task, f"{GATE_FIX_PREFIX} The card needs {counted} changed lines, "
+                                         f"over {cfg.oversize_triage_factor:g}x the {cfg.max_diff_lines}-line "
+                                         f"limit; it must be split.\n{failures}", triage_now=True)
+                return None
             if round_no >= FIX_ROUNDS:
                 # same prefix as the fix notes, so the card keeps only this latest gate log
                 await self._fail_attempt(task, f"{GATE_FIX_PREFIX} Still failing after {FIX_ROUNDS} "
@@ -894,22 +904,27 @@ class Orchestrator:
         return None
 
     # ------------------------------------------------------------ outcomes
-    async def _fail_attempt(self, task: Task, reason: str, triage: bool = True) -> None:
+    async def _fail_attempt(self, task: Task, reason: str, triage: bool = True,
+                            triage_now: bool = False) -> None:
+        """Attempts used up: triage, else blocked. Otherwise retry. With `triage_now` (the card
+        itself is the problem, e.g. far too big) triage runs before the attempts are used up."""
         task = self.store.get(task.id)
         self.store.add_feedback(task.id, reason)
         await self.git.remove_worktree(task.id, task.branch)
-        if task.attempts >= self.cfg.max_attempts:
+        last = task.attempts >= self.cfg.max_attempts
+        if last or (triage and triage_now):
             self.store.update(task.id, worktree=None, session_id=None)
             handled, note = await self._triage(task, reason) if triage else (False, "")
             if handled:
                 return
-            self.store.update(task.id, status="blocked", worktree=None, session_id=None)
-            self.notify(f"Orchestra: {task.id} blocked", (note or reason)[:300])
-            self.say(task.id, f"blocked after {task.attempts} attempts — needs a human. "
-                     f"Last reason: {reason[:300]}", "blocked")
-        else:
-            self.store.update(task.id, status="pending", worktree=None, session_id=None)
-            self.say(task.id, f"retrying: {reason.splitlines()[0][:200]}", "retry")
+            if last or note:  # attempts used up, or triage itself says a human must decide
+                self.store.update(task.id, status="blocked", worktree=None, session_id=None)
+                self.notify(f"Orchestra: {task.id} blocked", (note or reason)[:300])
+                self.say(task.id, f"blocked after {task.attempts} attempt(s) — needs a human. "
+                         f"Last reason: {reason[:300]}", "blocked")
+                return
+        self.store.update(task.id, status="pending", worktree=None, session_id=None)
+        self.say(task.id, f"retrying: {reason.splitlines()[0][:200]}", "retry")
 
     async def _block(self, task: Task, reason: str) -> None:
         self.store.add_feedback(task.id, reason)

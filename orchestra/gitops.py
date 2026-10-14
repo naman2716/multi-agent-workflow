@@ -13,6 +13,7 @@ import fnmatch
 import os
 import shutil
 import signal
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -68,6 +69,44 @@ async def _kill_group(proc: asyncio.subprocess.Process) -> None:
 
 async def git(repo: Path, *args: str, check: bool = True) -> str:
     return (await run(["git", *args], repo, check=check))[1].strip()
+
+
+def parse_numstat(out: str) -> "DiffStats":
+    """`git diff --numstat -z` output. -z gives real paths: a rename is
+    "<a>\t<r>\t\0<old>\0<new>\0", not "old => new"."""
+    files, added, removed, per_file = [], 0, 0, {}
+    parts = out.split("\0")
+    i = 0
+    while i < len(parts):
+        rec = parts[i]
+        i += 1
+        if not rec:
+            continue
+        a, r, f = rec.split("\t", 2)
+        if f == "":  # rename or copy: next two fields are old and new paths
+            old, f = parts[i], parts[i + 1]
+            i += 2
+            files.append(old)  # the old path is edited (deleted) too
+        files.append(f)
+        na, nr = (int(a) if a.isdigit() else 0), (int(r) if r.isdigit() else 0)
+        added, removed = added + na, removed + nr
+        per_file[f] = na + nr
+    return DiffStats(files, added, removed, per_file)
+
+
+async def working_diff_stats(wt: Path, base: str) -> "DiffStats":
+    """What the change would be if it were committed now: tracked edits and new files against
+    `base`. Stages into a throwaway index, so the worktree's own index is never touched."""
+    rc, index = await run(["git", "rev-parse", "--git-path", "index"], wt, check=False)
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d) / "index"
+        src = Path(index.strip()) if Path(index.strip()).is_absolute() else wt / index.strip()
+        if rc == 0 and src.exists():
+            shutil.copyfile(src, tmp)
+        env = {"GIT_INDEX_FILE": str(tmp)}
+        await run(["git", "add", "-A"], wt, check=True, env=env)
+        _, out = await run(["git", "diff", "--cached", "--numstat", "-z", base], wt, check=True, env=env)
+    return parse_numstat(out)
 
 
 @dataclass
@@ -149,26 +188,7 @@ class Git:
         await git(wt, "clean", "-fdq")
 
     async def diff_stats(self, wt: Path, since: str) -> DiffStats:
-        # -z gives real paths. A rename is "<a>\t<r>\t\0<old>\0<new>\0", not "old => new".
-        out = await git(wt, "diff", "--numstat", "-z", f"{since}...HEAD")
-        files, added, removed, per_file = [], 0, 0, {}
-        parts = out.split("\0")
-        i = 0
-        while i < len(parts):
-            rec = parts[i]
-            i += 1
-            if not rec:
-                continue
-            a, r, f = rec.split("\t", 2)
-            if f == "":  # rename or copy: next two fields are old and new paths
-                old, f = parts[i], parts[i + 1]
-                i += 2
-                files.append(old)  # the old path is edited (deleted) too
-            files.append(f)
-            na, nr = (int(a) if a.isdigit() else 0), (int(r) if r.isdigit() else 0)
-            added, removed = added + na, removed + nr
-            per_file[f] = na + nr
-        return DiffStats(files, added, removed, per_file)
+        return parse_numstat(await git(wt, "diff", "--numstat", "-z", f"{since}...HEAD"))
 
     async def diff_text(self, wt: Path, since: str, limit_chars: int | None = 60_000) -> str:
         """The change as a unified diff; `limit_chars=None` returns it whole (for scanners)."""
