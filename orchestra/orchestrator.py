@@ -815,28 +815,30 @@ class Orchestrator:
         return approved, verdict, reasons
 
     async def _validate(self, task: Task, wt: Path, diff: str, verdict: dict, env: dict) -> dict | None:
-        """Each blocking finding is checked by a validator; refuted ones are dropped."""
+        """One validator checks the review's blocking findings; refuted ones are dropped. A
+        finding without a clear "refuted" verdict (or a failed validator) stands."""
         findings = blocking_findings(verdict)
         checked = findings[:max(self.cfg.review.max_validations, 0)]
-        # validators that can run tests share the card's env slot (ports, test DB): one at a time
-        gate = asyncio.Semaphore(1 if self.cfg.review.reviewer_shell else 2)
-
-        async def one(f: dict):
-            async with gate:
-                return await self.runner.validate(self.cfg, task, wt, diff, f, env=env)
-        results = await asyncio.gather(*(one(f) for f in checked))
+        if not checked:
+            return verdict
+        r = await self.runner.validate(self.cfg, task, wt, diff, checked, env=env)
         await self.git.discard_uncommitted(wt)
-        refuted, limited = [], None
-        for f, r in zip(checked, results):
-            self.store.add_cost(task.id, r.cost_usd, r.tokens, r.session_id)
-            if r.limited:
-                limited = r
-            elif r.ok and r.data.get("confirmed") is False:
-                refuted.append({**f, "evidence": r.data.get("evidence", "")})
-                self.store.log(task.id, "validate", f"refuted: {f['text'][:200]} — {r.data.get('evidence', '')[:300]}")
-        if limited:
-            await self._pause_for_limit(task, limited, stage=REVIEW_STAGE)
+        self.store.add_cost(task.id, r.cost_usd, r.tokens, r.session_id)
+        if r.limited:
+            await self._pause_for_limit(task, r, stage=REVIEW_STAGE)
             return None
+        verdicts = {}
+        for v in (r.data.get("findings") or []) if r.ok else []:
+            if isinstance(v, dict) and isinstance(v.get("index"), int):
+                verdicts.setdefault(v["index"], v)  # first verdict per finding wins
+        refuted = []
+        for i, f in enumerate(checked, 1):
+            v = verdicts.get(i) or {}
+            if v.get("confirmed") is False:
+                refuted.append({**f, "evidence": v.get("evidence", "")})
+                self.store.log(task.id, "validate", f"refuted: {f['text'][:200]} — {v.get('evidence', '')[:300]}")
+        if not r.ok:
+            self.say(task.id, f"validator failed ({r.error[:120]}); the findings stand", "warn")
         self.say(task.id, f"validated {len(checked)} blocking finding(s): {len(refuted)} refuted", "validate")
         return drop_refuted(verdict, refuted)
 

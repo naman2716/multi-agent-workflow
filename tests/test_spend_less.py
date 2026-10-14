@@ -15,6 +15,7 @@ from orchestra.harness import build_files  # noqa: E402
 from orchestra.planning import build_tasks, render_plan  # noqa: E402
 from orchestra.store import Store, Task  # noqa: E402
 from orchestra.gates import make_size_guard  # noqa: E402
+from orchestra.orchestrator import Orchestrator  # noqa: E402
 from tests.test_orchestra import Base, FakeRunner, done, sh  # noqa: E402
 from tests.test_keep_good_work import sess  # noqa: E402
 from tests.test_run_without_you import TriageRunner  # noqa: E402
@@ -167,7 +168,7 @@ class CacheTTL(unittest.TestCase):
                  "worker": lambda: r.work(cfg, task, self.root, env={"SLOT": "1"}),
                  "test writer": lambda: r.write_tests(cfg, task, self.root),
                  "reviewer": lambda: r.review(cfg, task, self.root, "diff", {}, "log"),
-                 "validator": lambda: r.validate(cfg, task, self.root, "diff", {"kind": "issue", "text": "x"})}
+                 "validator": lambda: r.validate(cfg, task, self.root, "diff", [{"kind": "issue", "text": "x"}])}
         for role, call in calls.items():
             asyncio.run(call())
             self.assertEqual(r.options.env.get("FORCE_PROMPT_CACHING_5M"), "1", role)
@@ -242,6 +243,64 @@ class OversizeStopsEarly(Base):
         runner = self.run_oversized(120)                         # 1.2x the limit
         self.assertGreaterEqual(runner.calls["T01"], 2)
         self.assertIn("failed automated checks", runner.resumes["T01"][1] or "")
+
+
+class OneValidatorPerReview(Base):
+    VERDICT = {"verdict": "reject", "fixable": True, "feedback": "f", "scope_creep": [],
+               "criteria": [{"criterion": "C1", "met": False, "evidence": "e"}],
+               "issues": [{"severity": "blocker", "file": "a.py", "issue": "I1"},
+                          {"severity": "major", "file": "b.py", "issue": "I2"}]}
+
+    def validate_with(self, data=None, **kw):
+        class V(FakeRunner):
+            async def validate(inner, cfg, task, wt, diff, findings, env=None):
+                inner.seen = findings
+                return AgentResult(data or {}, 0.05, **kw)
+        runner = V({})
+        orch = Orchestrator(self.cfg, self.store, runner, log=self.logs.append)
+        self.add("V", ["a.py"])
+        out = asyncio.run(orch._validate(self.store.get("V"), self.repo, "diff", self.VERDICT, {}))
+        return out, runner
+
+    def test_all_findings_go_to_one_session_and_verdicts_map_back(self):
+        out, runner = self.validate_with({"findings": [
+            {"index": 2, "confirmed": False, "evidence": "I1 can't happen"},
+            {"index": 1, "confirmed": True, "evidence": "holds"},
+            {"index": 2, "confirmed": True, "evidence": "a second verdict is ignored"}]})
+        self.assertEqual([f["text"] for f in runner.seen], ["C1", "I1", "I2"])
+        self.assertEqual([i["issue"] for i in out["issues"]], ["I2"])   # 3 had no verdict: it stands
+        self.assertFalse(out["criteria"][0]["met"])
+        self.assertTrue(any("refuted: I1" in e["detail"] for e in self.store.events("V")))
+
+    def test_a_failed_validator_refutes_nothing(self):
+        out, _ = self.validate_with(ok=False, error="boom")
+        self.assertEqual(len(out["issues"]), 2)
+        self.assertTrue(any("validator failed" in line for line in self.logs))
+
+    def test_all_refuted_turns_into_an_approval(self):
+        out, _ = self.validate_with({"findings": [{"index": i, "confirmed": False, "evidence": "no"}
+                                                  for i in (1, 2, 3)]})
+        self.assertEqual(out["verdict"], "approve")
+
+    def test_one_call_per_review_in_a_run(self):
+        self.add("R", ["r.py"])
+        reject = AgentResult({**self.VERDICT, "issues": self.VERDICT["issues"]}, 0.1)
+        runner = FakeRunner({"R": [sess(done(**{"r.py": "x = 1\n"}))]}, review={"R": [reject, "approve"]})
+        self.run_orch(runner)
+        self.assertEqual(runner.validate_calls, 1)
+        self.assertEqual(runner.validations["R"], ["C1", "I1", "I2"])
+
+    def test_prompt_puts_card_and_diff_before_the_findings(self):
+        r = CapturingRunner()
+        findings = [{"kind": "issue", "text": "I1", "detail": "x"}, {"kind": "scope", "text": "S1"}]
+        asyncio.run(r.validate(self.cfg, Task(id="T1", title="t", spec="s"), self.repo, "DIFFTEXT", findings))
+        p = r.prompt
+        self.assertLess(p.index("# Task T1"), p.index("DIFFTEXT"))
+        self.assertLess(p.index("DIFFTEXT"), p.index("### Finding 1"))
+        self.assertLess(p.index("### Finding 1"), p.index("### Finding 2"))
+        self.assertEqual(r.options.max_turns, 35)
+        from orchestra.usage import classify
+        self.assertEqual(classify(p), "validator")  # orchestra usage still recognizes the session
 
 
 if __name__ == "__main__":

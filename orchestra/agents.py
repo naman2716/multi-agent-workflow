@@ -110,11 +110,17 @@ REVIEW_SCHEMA = {
 VALIDATE_SCHEMA = {
     "type": "object",
     "properties": {
-        "confirmed": {"type": "boolean", "description":
-                      "false only if you showed the finding is wrong; true if it holds or you can't tell"},
-        "evidence": {"type": "string", "description": "what you read or ran, and what it showed"},
+        "findings": {"type": "array", "description": "one verdict per numbered finding", "items": {
+            "type": "object",
+            "properties": {
+                "index": {"type": "integer", "description": "the finding's number"},
+                "confirmed": {"type": "boolean", "description":
+                              "false only if you showed the finding is wrong; true if it holds or you can't tell"},
+                "evidence": {"type": "string", "description": "what you read or ran, and what it showed"},
+            },
+            "required": ["index", "confirmed", "evidence"]}},
     },
-    "required": ["confirmed", "evidence"],
+    "required": ["findings"],
 }
 
 TESTS_SCHEMA = {
@@ -274,11 +280,12 @@ When you can, check behaviour instead of guessing: run the relevant tests or a s
 problems, each with where it is; every blocking finding will be independently verified.
 Set fixable to false only when the approach itself is wrong and starting over is better."""
 
-VALIDATOR_SYSTEM = """You verify one finding from a code review before it can block a change.
-Read the code and, when useful, run tests or a short script (read-only; never edit files or
-run state-changing git commands). Return confirmed=false only if you can show the finding is
-wrong (the criterion is met, the bug can't happen, the change is within the card's scope),
-with the evidence. If it holds, or you can't tell, return confirmed=true."""
+VALIDATOR_SYSTEM = """You verify the blocking findings of a code review before they can block a change.
+Check each numbered finding on its own evidence; one finding being right or wrong says nothing
+about the others. Read the code and, when useful, run tests or a short script (read-only; never
+edit files or run state-changing git commands). For each finding return confirmed=false only if
+you can show it is wrong (the criterion is met, the bug can't happen, the change is within the
+card's scope), with the evidence. If it holds, or you can't tell, return confirmed=true."""
 
 TEST_WRITER_APPEND = """
 You write the acceptance tests for ONE task card BEFORE anyone implements it.
@@ -475,7 +482,7 @@ class Runner(Protocol):
                      work_report: dict[str, Any], gate_log: str, impact: str = "",
                      graph: Path | None = None, note: str = "", model: str | None = None,
                      env: dict | None = None) -> AgentResult: ...
-    async def validate(self, cfg: Config, task: Task, worktree: Path, diff: str, finding: dict,
+    async def validate(self, cfg: Config, task: Task, worktree: Path, diff: str, findings: list[dict],
                        env: dict | None = None) -> AgentResult: ...
     async def triage(self, cfg: Config, task: Task, context: str, cwd: Path,
                      graph: Path | None = None) -> AgentResult: ...
@@ -653,16 +660,21 @@ class ClaudeRunner:
                                      REVIEW_SCHEMA, env, max_turns=40)
         return await self._run(prompt, opts, f"{task.id}:review")
 
-    async def validate(self, cfg: Config, task: Task, worktree: Path, diff: str, finding: dict,
+    async def validate(self, cfg: Config, task: Task, worktree: Path, diff: str, findings: list[dict],
                        env: dict | None = None) -> AgentResult:
+        """All of a review's blocking findings in one session (one cold start, not one per
+        finding). The card and diff come first and the findings last, so the prompt's shared
+        part stays the same from one review to the next."""
         what = {"criterion": "Reviewer says this acceptance criterion is NOT met",
                 "issue": "Reviewer reports this blocking problem",
-                "scope": "Reviewer says this is scope creep (outside the card)"}[finding["kind"]]
-        prompt = (f"{task_card(task)}\n\n## Finding to verify\n{what}:\n{finding['text']}\n"
-                  f"({finding.get('detail', '')})\n\n## Diff\n```diff\n{diff}\n```\n\n"
-                  "Verify this one finding, then answer.")
+                "scope": "Reviewer says this is scope creep (outside the card)"}
+        listed = "\n\n".join(f"### Finding {i}\n{what[f['kind']]}:\n{f['text']}\n({f.get('detail', '')})"
+                              for i, f in enumerate(findings, 1))
+        prompt = (f"{task_card(task)}\n\n## Diff\n```diff\n{diff}\n```\n\n"
+                  f"## Findings to verify\n{listed}\n\n"
+                  "Verify each finding, then answer with one verdict per finding number.")
         opts = self._checker_options(cfg, worktree, None, cfg.validator_model, VALIDATOR_SYSTEM,
-                                     VALIDATE_SCHEMA, env, max_turns=25)
+                                     VALIDATE_SCHEMA, env, max_turns=min(15 + 10 * len(findings), 60))
         return await self._run(prompt, opts, f"{task.id}:validate")
 
     async def triage(self, cfg: Config, task: Task, context: str, cwd: Path,

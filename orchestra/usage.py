@@ -125,7 +125,7 @@ def classify(prompt: str, folder: str = "") -> str:
     """The role of a session, from its first prompt (the shapes agents.py builds)."""
     if folder in ("groom-dispatch-review-session", "subagents", "interactive"):
         return "interactive"
-    if "\n## Finding to verify\n" in prompt:
+    if "\n## Finding to verify\n" in prompt or "\n## Findings to verify\n" in prompt:
         return "validator"
     if "\n## Worker's report\n" in prompt:
         return "reviewer"
