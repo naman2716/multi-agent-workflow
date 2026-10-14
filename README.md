@@ -115,6 +115,7 @@ orchestra retry T03 --note "Use the existing FCM helper in src/notify"
 orchestra test-first T04            # locked acceptance tests before the worker (or --off)
 orchestra ship                      # push + draft PR + CI by hand (runs do it with [ship].auto)
 orchestra ntfy setup                # once per project: questions and results on your phone
+orchestra usage path/to/export      # tokens and cost per card, role and session from agent transcripts
 ```
 
 ### Interactive side: the Claude Code harness

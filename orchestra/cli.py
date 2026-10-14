@@ -499,6 +499,21 @@ def cmd_stats(args) -> None:
                   "(compare similar-sized tasks before drawing conclusions)")
 
 
+def cmd_usage(args) -> None:
+    from . import usage
+    root = Path(args.export)
+    if not root.is_dir():
+        sys.exit(f"No such directory: {root}")
+    d = usage.to_dict(usage.build(root), cap=args.cap)
+    if not d["sessions"]:
+        sys.exit(f"No agent transcripts with usage under {root}")
+    if args.json:
+        Path(args.json).write_text(json.dumps(d, indent=2))
+    if args.csv:
+        Path(args.csv).write_text(usage.to_csv(d))
+    print(usage.render(d, md=args.markdown), end="")
+
+
 def cmd_harness(args) -> None:
     from .harness import install_harness
     cfg = Config.load(_repo(args))
@@ -641,6 +656,14 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("text", nargs="?"); s.set_defaults(fn=cmd_graph)
     s = sub.add_parser("stats", help="cost/token efficiency with vs without the graph")
     s.set_defaults(fn=cmd_stats)
+    s = sub.add_parser("usage", help="token and cost breakdown of an export of agent transcripts")
+    s.add_argument("export", nargs="?", default=".orchestra/export",
+                   help="export dir with agent-transcripts/ (and tasks.json/events.json or state.db)")
+    s.add_argument("--json", help="also write the full report as JSON to this file")
+    s.add_argument("--csv", help="also write one row per session to this CSV file")
+    s.add_argument("--markdown", action="store_true", help="print Markdown tables")
+    s.add_argument("--cap", type=int, default=8000, help="tool-output size for the what-if (chars)")
+    s.set_defaults(fn=cmd_usage)
     s = sub.add_parser("harness", help="install the Claude Code harness into this repo")
     s.add_argument("action", choices=["install"]); s.add_argument("--no-graph", action="store_true")
     s.add_argument("--no-git-hooks", action="store_true"); s.set_defaults(fn=cmd_harness)
