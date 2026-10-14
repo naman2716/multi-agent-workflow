@@ -101,6 +101,16 @@ characters of a ~28k prompt because `## Finding to verify` sits before the diff 
 **Tests:** `sandbox_settings`/options include the key with the configured value; 0 leaves it out;
 the clamp range is enforced (4000–128000).
 
+**As built (Phase 2).** The CLI's code shows its limit keeps only the head
+(`slice(0, cap) + " ... [N lines truncated] ..."`, and "Preview (first …)" for saved output), with
+no exception for failing commands, so a pytest summary at the end would be lost. The setting is
+not used. Instead a PreToolUse hook (`guards.make_output_cap`) rewrites each foreground worker
+and test-writer Bash command to capture its output to a temp file and print it whole, or above
+the cap as the first 3/8 and last 5/8 with a `[truncated N chars]` note. It runs in the same shell
+(cd sticks, exit status kept), and output survives an `exit` in the command or a kill on timeout.
+Tested in bash and zsh. Not yet seen inside a live sandboxed CLI session; if no temp file can be
+made, output passes through uncapped.
+
 ## 5. Prompt prefix audit
 
 Render order is tools → system → messages; a cache hit needs a byte-identical prefix. Order today:
