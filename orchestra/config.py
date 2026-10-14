@@ -6,6 +6,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .gitops import parse_identity
 from .graph import GraphSettings
 
 
@@ -113,6 +114,20 @@ class AgentSettings:
 
 
 @dataclass
+class GitSettings:
+    """Who Orchestra's commits are by, and whether the project's commit hooks run."""
+    author: str = "user"     # "user": your git config user.name/user.email; "orchestra"; or "Name <email>"
+    co_author: str = ""      # "Name <email>": adds a Co-authored-by trailer to every Orchestra commit
+    run_hooks: bool = False  # run pre-commit/commit-msg hooks on commits of agent work
+
+    def __post_init__(self):
+        if self.author not in ("user", "orchestra") and parse_identity(self.author) is None:
+            raise ValueError(f'[git] author must be "user", "orchestra" or "Name <email>", not {self.author!r}')
+        if self.co_author and parse_identity(self.co_author) is None:
+            raise ValueError(f'[git] co_author must be "Name <email>", not {self.co_author!r}')
+
+
+@dataclass
 class Autonomy:
     """Self-healing: a triage agent looks at a card before it is blocked."""
     triage: bool = True
@@ -209,6 +224,7 @@ class Config:
     notify_cmd: str = ""  # shell command run with $ORCHESTRA_TITLE / $ORCHESTRA_MESSAGE
     autonomy: Autonomy = field(default_factory=Autonomy)
     agents: AgentSettings = field(default_factory=AgentSettings)
+    git: GitSettings = field(default_factory=GitSettings)
     ship: Ship = field(default_factory=Ship)
     ntfy: NtfySettings = field(default_factory=NtfySettings)
     linear: LinearSettings = field(default_factory=LinearSettings)
@@ -289,6 +305,7 @@ class Config:
             decision_wait_minutes=o.get("decision_wait_minutes", 60),
             autonomy=section(Autonomy, "autonomy"),
             agents=section(AgentSettings, "agents"),
+            git=section(GitSettings, "git"),
             ship=section(Ship, "ship"),
             ntfy=_with_saved_topics(section(NtfySettings, "ntfy"),
                                     repo / o.get("state_dir", ".orchestra") / NTFY_TOPICS_FILE),
@@ -394,6 +411,18 @@ command = ""
 # on public ntfy.sh, so don't put them in this file if it is committed.
 server = "https://ntfy.sh"
 token_env = "NTFY_TOKEN"   # optional access token (protected or self-hosted server)
+
+[git]
+# Who Orchestra's commits are by (author and committer alike). GitHub links a commit to your
+# account by its email, so "user" (your git config user.name / user.email) makes agent work count
+# as yours. "orchestra" = Orchestra <orchestra@local>; or a literal "Name <email>".
+author = "user"
+co_author = ""           # "Name <email>": adds "Co-authored-by: Name <email>" to every Orchestra commit
+# true: commits of agent work run the repo's installed pre-commit / commit-msg hooks (a failing
+# hook goes back to the worker like a failed gate). Orchestra's own re-commits of work that
+# already passed (squash, locked tests, clean merges) always skip them. Hooks must be installed
+# (e.g. `pre-commit install`); a config file in the repo alone runs nothing.
+run_hooks = false
 
 [autonomy]
 # Before a card is blocked, a triage agent may rewrite it, retry it on a stronger model, or

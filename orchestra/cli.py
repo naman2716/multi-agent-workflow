@@ -35,6 +35,7 @@ from pathlib import Path
 
 from .agents import ClaudeRunner
 from .config import CONFIG_TEMPLATE, Config, detect_gates, render_gates
+from .gitops import IdentityError, resolve_identity
 from .graph import Graph, GraphData, graphify_available
 from .orchestrator import Orchestrator
 from .planning import PlanError, build_tasks, plan_fingerprint, render_plan, save_plan
@@ -264,6 +265,10 @@ def cmd_run(args) -> None:
     store = _store(cfg)
     if args.no_wait:
         cfg.limits.wait_for_reset = False
+    try:  # commits are made as this identity; never start a run without one
+        resolve_identity(cfg.repo, cfg.git.author)
+    except IdentityError as e:
+        sys.exit(str(e))
     if live := store.live_lease():
         print(f"{RunLocked(live)}.\nWatch it with `orchestra status`; only one run works the queue "
               "at a time.", file=sys.stderr)

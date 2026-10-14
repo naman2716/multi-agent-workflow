@@ -35,9 +35,9 @@ from typing import Callable
 from .agents import (GATE_FIX_PREFIX, Runner, blocking_findings, check_verdict, drop_refuted,
                      model_family, pick_reviewer_model, pick_worker_model, task_card)
 from .config import Config
-from .gates import in_scope, run_gates, summarize_failures
+from .gates import GateResult, in_scope, run_gates, summarize_failures
 from .asking import LineSource, parse_answer, render_question
-from .gitops import Git, clone_into, matches_any, run
+from .gitops import Git, HookRejected, clone_into, matches_any, run
 from .graph import Graph, GraphData
 from .limits import UsageLimits, notify
 from .linear import Linear
@@ -100,7 +100,7 @@ class Orchestrator:
         self._held: list[str] = []
         self._slots: dict[str, int] = {}  # running card -> environment slot
         self._asked: set[str] = set()
-        self.git = Git(cfg.repo, cfg.worktree_root, cfg.base_branch, cfg.integration_branch)
+        self.git = Git(cfg.repo, cfg.worktree_root, cfg.base_branch, cfg.integration_branch, cfg.git)
         self.handoff_dir = cfg.state_path / "handoffs"
         self.stop_reason = ""
         self.graph = Graph(cfg.repo, cfg.worktree_root, cfg.integration_branch, cfg.state_path,
@@ -269,7 +269,9 @@ class Orchestrator:
 
     # ------------------------------------------------------------ main loop
     async def run(self) -> dict[str, int]:
-        """Work the queue. Raises store.RunLocked if another live run holds this repo."""
+        """Work the queue. Raises store.RunLocked if another live run holds this repo, and
+        gitops.IdentityError (before taking the queue) if there is no identity to commit as."""
+        self.git.identity  # noqa: B018 - resolve now: fail before any card is claimed
         token = self.store.acquire_lease()
         beat = asyncio.create_task(self._heartbeat(token))
         try:
@@ -668,7 +670,12 @@ class Orchestrator:
         if res.data.get("status") == "blocked":
             await self._block(task, f"Test writer reported blocked: {res.data.get('blocker')}")
             return False
-        await self.git.commit_all(wt, f"{task.id}: acceptance tests")
+        try:
+            await self.git.commit_all(wt, f"{task.id}: acceptance tests", hooks=True, env=env)
+        except HookRejected as e:
+            await self._fail_attempt(task, "The test writer's commit was rejected by the repository's commit "
+                                     f"hooks:\n{e.output.strip()[-2000:]}")
+            return False
         changed = await self.git.changed_files(wt, base)
         deleted = await self.git.changed_files(wt, base, deleted=True)
         bad = [f for f in changed if not matches_any(f, cfg.test_globs)] + deleted
@@ -733,35 +740,44 @@ class Orchestrator:
                 await self._block(task, f"Worker reported blocked: {report.get('blocker')}")
                 return None
 
-            await self.git.commit_all(wt, f"{task.id}: {task.title}\n\n{report.get('summary', '')}")
-            if task.locked_tests:  # gates always check the locked versions
-                restored = self._restore_locked(task, wt)
-                if restored:
-                    await self.git.commit_all(wt, f"{task.id}: restore locked acceptance tests")
-                    self.say(task.id, f"restored locked acceptance tests the worker changed: {restored}", "tests")
-                    self.store.add_feedback(task.id, f"The locked acceptance tests {restored} were edited; "
-                                            "the orchestrator restored them. Make the code pass them as written.")
-            stats = await self.git.diff_stats(wt, base)
-            if not stats.files:
-                await self._fail_attempt(task, "Worker reported done but changed no files.")
-                return None
-            diff = await self.git.diff_text(wt, base, limit_chars=None)  # whole diff for the secret scan
-            results = await run_gates(cfg, wt, stats, diff, task.files_scope, env=env, quick=round_no > 0,
-                                      exempt=task.locked_tests)
-            await self.git.discard_uncommitted(wt)
-            gate_log = "\n".join(f"- {r.name}: {'pass' if r.passed else 'FAIL'}"
-                                 + (f" ({r.detail})" if r.passed and r.detail else "") for r in results)
-            if all(r.passed for r in results):
-                size = next((r.detail for r in results if r.name == "diff_size"), f"{stats.lines} lines")
-                self.say(task.id, f"gates passed ({size}, {len(stats.files)} files)")
-                return report, gate_log
+            try:
+                await self.git.commit_all(wt, f"{task.id}: {task.title}\n\n{report.get('summary', '')}",
+                                          hooks=True, env=env)
+            except HookRejected as e:
+                # like a failed gate: the worker gets the hook's output in the same session; the
+                # worktree keeps what the hooks changed (formatter fixes)
+                results = [GateResult(False, "git hooks", f"the repository's commit hooks rejected the "
+                                      f"commit:\n{e.output.strip()[-3000:]}")]
+            else:
+                if task.locked_tests:  # gates always check the locked versions
+                    restored = self._restore_locked(task, wt)
+                    if restored:
+                        await self.git.commit_all(wt, f"{task.id}: restore locked acceptance tests")
+                        self.say(task.id, f"restored locked acceptance tests the worker changed: {restored}", "tests")
+                        self.store.add_feedback(task.id, f"The locked acceptance tests {restored} were edited; "
+                                                "the orchestrator restored them. Make the code pass them as written.")
+                stats = await self.git.diff_stats(wt, base)
+                if not stats.files:
+                    await self._fail_attempt(task, "Worker reported done but changed no files.")
+                    return None
+                diff = await self.git.diff_text(wt, base, limit_chars=None)  # whole diff for the secret scan
+                results = await run_gates(cfg, wt, stats, diff, task.files_scope, env=env, quick=round_no > 0,
+                                          exempt=task.locked_tests)
+                await self.git.discard_uncommitted(wt)
+                gate_log = "\n".join(f"- {r.name}: {'pass' if r.passed else 'FAIL'}"
+                                     + (f" ({r.detail})" if r.passed and r.detail else "") for r in results)
+                if all(r.passed for r in results):
+                    size = next((r.detail for r in results if r.name == "diff_size"), f"{stats.lines} lines")
+                    self.say(task.id, f"gates passed ({size}, {len(stats.files)} files)")
+                    return report, gate_log
             failures = summarize_failures(results)
             self.say(task.id, f"gates failed (round {round_no + 1}): "
                      f"{', '.join(r.name for r in results if not r.passed)}", "gate")
             self.store.end_session(res.session_id, "gate_failed")
-            counted = stats.counted(list(cfg.diff_exclude) + list(task.locked_tests))
-            if (any(r.name == "diff_size" and not r.passed for r in results)
-                    and counted > cfg.max_diff_lines * cfg.oversize_triage_factor):
+            # only a diff_size failure has fresh stats (a hook rejection committed nothing)
+            too_big = any(r.name == "diff_size" and not r.passed for r in results)
+            counted = stats.counted(list(cfg.diff_exclude) + list(task.locked_tests)) if too_big else 0
+            if too_big and counted > cfg.max_diff_lines * cfg.oversize_triage_factor:
                 # far too big to trim in place, and a fresh attempt would build the same thing
                 self.say(task.id, f"{counted} lines is over {cfg.oversize_triage_factor:g}x the limit "
                          "→ to triage now, no trim round", "gate")

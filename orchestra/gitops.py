@@ -11,8 +11,10 @@ from __future__ import annotations
 import asyncio
 import fnmatch
 import os
+import re
 import shutil
 import signal
+import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,6 +22,72 @@ from pathlib import Path
 
 class GitError(RuntimeError):
     pass
+
+
+class HookRejected(GitError):
+    """The repository's pre-commit or commit-msg hook refused a commit; `output` says why."""
+
+    def __init__(self, output: str):
+        self.output = output
+        super().__init__(f"git hooks rejected the commit:\n{output[-2000:]}")
+
+
+class IdentityError(RuntimeError):
+    """No usable commit identity (Orchestra never falls back to another one)."""
+
+
+# ---------------------------------------------------------------- commit identity
+@dataclass(frozen=True)
+class Identity:
+    name: str
+    email: str
+
+    def __str__(self) -> str:
+        return f"{self.name} <{self.email}>"
+
+    def env(self) -> dict[str, str]:
+        """Author and committer both: GitHub shows one identity, and stray GIT_* variables in
+        the environment can't split them."""
+        return {"GIT_AUTHOR_NAME": self.name, "GIT_AUTHOR_EMAIL": self.email,
+                "GIT_COMMITTER_NAME": self.name, "GIT_COMMITTER_EMAIL": self.email}
+
+
+ORCHESTRA_IDENTITY = Identity("Orchestra", "orchestra@local")
+_IDENTITY_RE = re.compile(r"^\s*([^<>\n]*?\S)\s*<([^<>\s@]+@[^<>\s]+)>\s*$")
+HOOK_TIMEOUT_S = 600  # commits that run the project's hooks (pre-commit can be slow)
+
+
+def parse_identity(value: str) -> Identity | None:
+    """'Name <email>' -> Identity, else None."""
+    m = _IDENTITY_RE.match(value or "")
+    return Identity(m.group(1), m.group(2)) if m else None
+
+
+def resolve_identity(repo: Path, author: str) -> Identity:
+    """[git] author -> the identity Orchestra commits as. "user" reads git config in `repo`
+    (local, global, system and includeIf all apply); a missing value is an error, not a fallback."""
+    if author == "orchestra":
+        return ORCHESTRA_IDENTITY
+    if author != "user":
+        ident = parse_identity(author)
+        if ident is None:
+            raise IdentityError(f'[git] author must be "user", "orchestra" or "Name <email>", not {author!r}')
+        return ident
+
+    def get(key: str) -> str:
+        r = subprocess.run(["git", "config", "--get", key], cwd=repo, capture_output=True, text=True)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    name, email = get("user.name"), get("user.email")
+    missing = [k for k, v in (("user.name", name), ("user.email", email)) if not v]
+    if missing:
+        sets = "\n".join(f'  git config --global {k} "{"Your Name" if k == "user.name" else "you@example.com"}"'
+                         for k in missing)
+        raise IdentityError(
+            f"Orchestra commits as you ([git] author = \"user\"), but git config {' and '.join(missing)} "
+            f"{'is' if len(missing) == 1 else 'are'} not set in {repo}. Set {'it' if len(missing) == 1 else 'them'} "
+            f"(use the email on your GitHub account so commits are linked to you):\n{sets}\n"
+            'or set [git] author = "Name <email>" (or "orchestra") in orchestra.toml.')
+    return Identity(name, email)
 
 
 async def run(cmd: list[str] | str, cwd: Path, timeout: int = 300, check: bool = True,
@@ -134,9 +202,39 @@ def matches_any(path: str, patterns) -> bool:
 
 
 class Git:
-    def __init__(self, repo: Path, worktree_root: Path, base: str, integration: str):
+    def __init__(self, repo: Path, worktree_root: Path, base: str, integration: str, settings=None):
+        """`settings` is the [git] section (author, co_author, run_hooks); defaults when None."""
+        from .config import GitSettings
         self.repo, self.root, self.base, self.integration = repo, worktree_root, base, integration
+        self.settings = settings or GitSettings()
+        self._identity: Identity | None = None
         self._merge_lock = asyncio.Lock()
+
+    @property
+    def identity(self) -> Identity:
+        """Resolved on first use; raises IdentityError rather than committing as anyone else."""
+        if self._identity is None:
+            self._identity = resolve_identity(self.repo, self.settings.author)
+        return self._identity
+
+    async def _commit(self, wt: Path, message: str, *extra: str, hooks: bool = False,
+                      env: dict | None = None) -> None:
+        """Every Orchestra commit: as the configured identity, with the co-author trailer.
+        `hooks` (commits of new agent work) runs the project's pre-commit/commit-msg hooks when
+        [git] run_hooks is on and raises HookRejected if they refuse; all other commits re-record
+        content that already passed and skip them (--no-verify)."""
+        ident = self.identity
+        args = ["git", "commit", "-q", *extra, "-m", message]
+        co = self.settings.co_author
+        if co and parse_identity(co) != ident:
+            args += ["--trailer", f"Co-authored-by: {co}"]
+        verify = hooks and self.settings.run_hooks
+        if not verify:
+            args.insert(2, "--no-verify")
+        rc, out = await run(args, wt, timeout=HOOK_TIMEOUT_S if verify else 300, check=not verify,
+                            env={**(env or {}), **ident.env()})
+        if rc != 0:
+            raise HookRejected(out)
 
     async def ensure_integration_branch(self) -> None:
         rc, _ = await run(["git", "rev-parse", "--verify", f"refs/heads/{self.integration}"],
@@ -169,15 +267,16 @@ class Git:
         if branch:
             await git(self.repo, "branch", "-D", branch, check=False)
 
-    async def commit_all(self, wt: Path, message: str) -> bool:
-        """Commit whatever the worker changed. Returns False if nothing changed."""
+    async def commit_all(self, wt: Path, message: str, hooks: bool = False, env: dict | None = None) -> bool:
+        """Commit whatever the worker changed. Returns False if nothing changed. With `hooks`
+        (new agent work) the project's hooks may run and raise HookRejected; the worktree is
+        left as the hooks left it (formatters' fixes included)."""
         await git(wt, "add", "-A")
         rc, _ = await run(["git", "diff", "--cached", "--quiet"], wt, check=False)
         merging = (await run(["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"], wt, check=False))[0] == 0
         if rc == 0 and not merging:  # a merge is committed even if it kept this side unchanged
             return False
-        await git(wt, "-c", "user.name=Orchestra", "-c", "user.email=orchestra@local",
-                  "commit", "-q", "--no-verify", "-m", message)
+        await self._commit(wt, message, hooks=hooks, env=env)
         return True
 
     async def discard_uncommitted(self, wt: Path) -> None:
@@ -201,8 +300,7 @@ class Git:
         return await git(wt, "merge-base", "HEAD", self.integration)
 
     async def rebase_onto_integration(self, wt: Path) -> tuple[bool, str]:
-        rc, out = await run(["git", "-c", "user.name=Orchestra", "-c", "user.email=orchestra@local",
-                             "rebase", self.integration], wt, check=False)
+        rc, out = await run(["git", "rebase", self.integration], wt, check=False, env=self.identity.env())
         if rc != 0:
             await run(["git", "rebase", "--abort"], wt, check=False)
             return False, out
@@ -214,14 +312,13 @@ class Git:
                 await git(wt, "rev-parse", "HEAD^") == await git(wt, "rev-parse", base):
             return  # already a single commit on base
         await git(wt, "reset", "-q", "--soft", base)
-        await git(wt, "-c", "user.name=Orchestra", "-c", "user.email=orchestra@local",
-                  "commit", "-q", "--no-verify", "--allow-empty", "-m", message)
+        await self._commit(wt, message, "--allow-empty")
 
     async def start_merge(self, wt: Path, ref: str) -> list[str] | None:
         """Merge `ref` into the worktree without committing. Returns the conflicted files
         ([] when the merge applied cleanly), or None if git failed for another reason."""
-        rc, out = await run(["git", "-c", "user.name=Orchestra", "-c", "user.email=orchestra@local",
-                             "merge", "--no-ff", "--no-commit", ref], wt, check=False)
+        rc, out = await run(["git", "merge", "--no-ff", "--no-commit", ref], wt, check=False,
+                            env=self.identity.env())
         conflicted = (await git(wt, "diff", "--name-only", "--diff-filter=U", check=False)).split()
         if rc != 0 and not conflicted:
             await self.abort_merge(wt)
@@ -233,8 +330,7 @@ class Git:
 
     async def commit_merge(self, wt: Path, message: str) -> None:
         await git(wt, "add", "-A")
-        await git(wt, "-c", "user.name=Orchestra", "-c", "user.email=orchestra@local",
-                  "commit", "-q", "--no-verify", "-m", message)
+        await self._commit(wt, message)
 
     async def changed_files(self, wt: Path, since: str, deleted: bool = False) -> list[str]:
         """Files changed since `since` (without deletions), or only the deleted ones."""
