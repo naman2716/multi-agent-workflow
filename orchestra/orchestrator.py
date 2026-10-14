@@ -16,6 +16,11 @@ Usage limit hit -> dispatch pauses until the reset; cut-off agents resume their 
 A per-run budget stops new dispatches once this run has spent it.
 Only one run works a repository's queue at a time (a heartbeat lease in the store); after a
 crash, cards with their worktree and session intact resume where they stopped.
+
+Before a card is blocked, a triage agent may rewrite it, move it to a stronger model, or split
+it (once per card). After the queue drains, a run that merged work pushes the integration
+branch, opens or updates a draft PR, waits for CI, and turns red checks into a fix card.
+With ntfy configured, questions and results reach your phone, and replies answer questions.
 """
 from __future__ import annotations
 
@@ -28,14 +33,18 @@ from pathlib import Path
 from typing import Callable
 
 from .agents import (GATE_FIX_PREFIX, Runner, blocking_findings, check_verdict, drop_refuted,
-                     pick_reviewer_model, pick_worker_model)
+                     model_family, pick_reviewer_model, pick_worker_model, task_card)
 from .config import Config
-from .gates import run_gates, summarize_failures
+from .gates import in_scope, run_gates, summarize_failures
 from .asking import LineSource, parse_answer, render_question
 from .gitops import Git, clone_into, matches_any, run
 from .graph import Graph, GraphData
 from .limits import UsageLimits, notify
-from .store import Store, Task
+from .linear import Linear
+from .ntfy import REPLY_HELP, Ntfy, parse_reply, question_tag
+from .planning import PlanError, _scopes_overlap, build_tasks
+from .ship import Shipper, ShipResult
+from .store import OPEN_STATUSES, Store, Task
 
 FIX_ROUNDS = 2  # gate-failure fix loops inside one attempt, before starting fresh
 REVIEW_STAGE = "__resume_at_review__"  # resume marker: worker done, only review was cut off
@@ -51,6 +60,11 @@ CONFLICT_NOTE = ("Your approved change conflicts with work other cards merged me
                  "conflict markers (<<<<<<< / ======= / >>>>>>>):\n{files}\n"
                  "Resolve every conflict so both changes' behaviour is kept, remove all markers, run "
                  "the checks, and report done. Don't run git commands.")
+NTFY_POLL_S = 10.0
+
+
+class TriageRejected(ValueError):
+    """The triage agent's action can't be applied as given; the card goes to the human."""
 
 
 def slot_env(cfg: Config, task_id: str, slot: int) -> dict[str, str]:
@@ -94,9 +108,103 @@ class Orchestrator:
         self.limits = UsageLimits(cfg.limits, log=lambda m: self.say(None, m, "limit"))
         if getattr(runner, "on_limit", "missing") is None:
             runner.on_limit = self.limits.observe
+        self.ntfy = Ntfy.from_settings(cfg.ntfy, label=cfg.repo.name)
+        self.ntfy_poll_s = NTFY_POLL_S
+        self._pushes: set[asyncio.Task] = set()
+        self._triage_lock = asyncio.Lock()
+        self.shipper = Shipper(cfg, store, log=lambda m: self.say(None, m, "ship"))
+        self.pr: dict | None = None  # the draft PR this run opened or updated
+        self._run_started = time.time()
 
-    def notify(self, title: str, message: str) -> None:
+    @property
+    def _phone(self) -> bool:
+        """Answers can come from the phone (ntfy reply topic configured)."""
+        return bool(self.ntfy and self.ntfy.can_receive)
+
+    def notify(self, title: str, message: str, url: str | None = None) -> None:
         notify(self.cfg.notify_cmd, title, message)
+        if self.ntfy:
+            actions = [{"action": "view", "label": "Open", "url": url, "clear": False}] if url else None
+            self._spawn(self.ntfy.publish(title, message, actions=actions), "ntfy notification")
+
+    def _spawn(self, coro, what: str) -> None:
+        """Fire-and-forget network call (ntfy) that must never slow down or break the run."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            coro.close()
+            return
+        fut = loop.create_task(coro)
+        self._pushes.add(fut)
+
+        def done(f: asyncio.Task) -> None:
+            self._pushes.discard(f)
+            if not f.cancelled() and f.exception() is not None:
+                self.say(None, f"{what} failed: {f.exception()!r}", "warn")
+        fut.add_done_callback(done)
+
+    async def _flush_pushes(self, timeout: float = 20.0) -> None:
+        if self._pushes:
+            await asyncio.wait(set(self._pushes), timeout=timeout)
+
+    # ------------------------------------------------------------ answers from the phone
+    async def _ntfy_replies(self) -> None:
+        """Read answers from the ntfy reply topic while any card waits for a decision."""
+        warned = False
+        while True:
+            try:
+                if self.store.waiting():
+                    await self._poll_replies()
+                warned = False
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                if not warned:
+                    self.say(None, f"couldn't read ntfy replies ({e!r}); will keep trying", "warn")
+                    warned = True
+            await asyncio.sleep(self.ntfy_poll_s)
+
+    async def _poll_replies(self) -> None:
+        state = self.store.get_meta("ntfy_replies") or {}
+        since = int(state.get("since") or self._run_started)
+        seen = list(state.get("seen", []))
+        msgs = await self.ntfy.poll(max(since - 1, 0))  # dedupe below; don't miss same-second messages
+        for m in sorted(msgs, key=lambda m: m.get("time", 0)):
+            mid = m.get("id")
+            if not mid or mid in seen:
+                continue
+            seen.append(mid)
+            since = max(since, int(m.get("time") or since))
+            # persisted per message, so a crash never answers twice
+            self.store.set_meta("ntfy_replies", {"since": since, "seen": seen[-200:]})
+            self._handle_reply(m.get("message") or "")
+
+    def _reply(self, message: str) -> None:
+        self._spawn(self.ntfy.publish("Orchestra", message), "ntfy reply")
+
+    def _handle_reply(self, text: str) -> None:
+        """Apply one phone reply. Only a card that is waiting for a decision can change."""
+        parsed = parse_reply(text)
+        if not parsed:
+            return self._reply(f"Couldn't read that reply. {REPLY_HELP}")
+        tid, tag, rest = parsed
+        try:
+            t = self.store.get(tid)
+        except KeyError:
+            return self._reply(f"There is no card {tid}.")
+        if t.status != "waiting" or not t.decision:
+            return self._reply(f"{tid} isn't waiting for a decision (it's {t.status}); reply ignored.")
+        if tag and tag != question_tag(str(self.cfg.repo), t.id, t.decision):
+            return self._reply(f"That button was for an earlier question on {tid}; ignored. "
+                               f"It now asks: {t.decision.get('question', '')[:200]}")
+        kind, val = parse_answer(rest, t.decision)
+        if kind == "later":
+            return self._reply(f"{tid} left for later.")
+        if kind == "invalid":
+            return self._reply(f"{tid}: {val}")
+        self.store.answer(tid, val)
+        self.say(tid, f"answered from your phone: {val[:200]}", "decision")
+        self._reply(f"✓ {tid} resumes with: {val}")
 
     def say(self, task_id: str | None, msg: str, kind: str = "info") -> None:
         stamp = time.strftime("%H:%M:%S")
@@ -201,16 +309,58 @@ class Orchestrator:
 
     async def _run(self) -> dict[str, int]:
         self._start_cost = self.store.total_cost()
-        started = time.time()
+        started = self._run_started = time.time()
         await self.git.ensure_integration_branch()
         await self._recover()
         if self.cfg.graph.enabled:
             await self.graph.refresh()
+        merged_before = {t.id for t in self.store.all() if t.status == "merged"}
+        for t in self.store.waiting():  # questions from before ntfy was set up (or not delivered)
+            if not (t.decision or {}).get("pushed_at"):
+                self._push_question(t.id)
+        replies = asyncio.create_task(self._ntfy_replies()) if self._phone else None
+        try:
+            await self._retriage_deferred()
+            await self._drain()
+            if self.cfg.ship.auto:
+                await self._ship_and_fix(merged_before)
+        finally:
+            if replies:
+                replies.cancel()
 
+        for t in self.store.unrunnable():
+            self.say(t.id, "cannot run: a dependency is blocked", "warn")
+        waiting = self.store.waiting()
+        for t in waiting:
+            self.say(t.id, f"waiting for your decision: {t.decision.get('question', '')[:200]}", "decision")
+        counts = self.store.counts()
+        spent = self.run_spent()
+        self.store.set_meta("last_run", {"started_at": started, "finished_at": time.time(),
+                                         "spent_usd": round(spent, 4), "counts": counts,
+                                         "stop_reason": self.stop_reason, "pr": self.pr})
+        self.say(None, f"run finished: {counts} · this run ${spent:.2f} "
+                 f"(lifetime ${self.store.total_cost():.2f})"
+                 + (f" · stopped: {self.stop_reason}" if self.stop_reason else ""))
+        for fut in self.prompts:
+            fut.cancel()
+        msg = f"{counts['merged']} merged, {counts['blocked']} blocked, {len(waiting)} need your decision"
+        if self.pr:
+            msg += f"\nPR: {self.pr['url']} (CI {self.pr['ci']})"
+        self.notify("Orchestra run finished", msg + (". Run: orchestra decisions" if waiting else ""),
+                    url=(self.pr or {}).get("url"))
+        await self._flush_pushes()
+        return counts
+
+    async def _drain(self, answers_since: float = 0.0) -> None:
+        """Dispatch ready cards until nothing more can run in this run. When only questions
+        are left, wait a while for answers to questions asked since `answers_since`."""
         running: dict[asyncio.Task, str] = {}
         self._running = running
         idle_since: float | None = None
         wait_answers_s = self.cfg.decision_wait_minutes * 60
+
+        def open_questions() -> bool:
+            return any((t.decision or {}).get("asked_at", 0) >= answers_since for t in self.store.waiting())
         while True:
             self._schedule_prompts()
             self._cancel_stale_prompts()
@@ -238,14 +388,15 @@ class Orchestrator:
                     continue
                 if self.limits.paused and not self.cfg.limits.wait_for_reset:
                     self.stop_reason = "usage limit reached (wait_for_reset = false); re-run later"
-                # Without a terminal, stay alive for a while so a decision answered elsewhere
-                # (Claude Code's /decide, another terminal) resumes in this same run.
-                if (not self.asker and not self.stop_reason and self.store.waiting()
+                # Without a terminal (or with answers from the phone), stay alive for a while so
+                # a decision answered elsewhere (/decide, another terminal, ntfy) resumes in this run.
+                if ((not self.asker or self._phone) and not self.stop_reason and open_questions()
                         and wait_answers_s > 0):
                     if idle_since is None:
                         idle_since = time.time()
                         self.say(None, f"waiting up to {self.cfg.decision_wait_minutes:g} min for "
-                                 "answers (orchestra decisions / orchestra answer, or /decide)")
+                                 "answers (orchestra decisions / orchestra answer, or /decide"
+                                 + (", or from your phone" if self._phone else "") + ")")
                     if time.time() - idle_since < wait_answers_s:
                         await asyncio.sleep(self.poll_s)
                         continue
@@ -260,26 +411,93 @@ class Orchestrator:
                 tid = running.pop(fut)
                 if exc := fut.exception():
                     self.say(tid, f"orchestrator error: {exc!r}", "error")
-                    await self._fail_attempt(self.store.get(tid), f"Internal error: {exc!r}")
+                    await self._fail_attempt(self.store.get(tid), f"Internal error: {exc!r}", triage=False)
 
-        for t in self.store.unrunnable():
-            self.say(t.id, "cannot run: a dependency is blocked", "warn")
-        waiting = self.store.waiting()
-        for t in waiting:
-            self.say(t.id, f"waiting for your decision: {t.decision.get('question', '')[:200]}", "decision")
-        counts = self.store.counts()
-        spent = self.run_spent()
-        self.store.set_meta("last_run", {"started_at": started, "finished_at": time.time(),
-                                         "spent_usd": round(spent, 4), "counts": counts,
-                                         "stop_reason": self.stop_reason})
-        self.say(None, f"run finished: {counts} · this run ${spent:.2f} "
-                 f"(lifetime ${self.store.total_cost():.2f})"
-                 + (f" · stopped: {self.stop_reason}" if self.stop_reason else ""))
-        for fut in self.prompts:
-            fut.cancel()
-        msg = f"{counts['merged']} merged, {counts['blocked']} blocked, {len(waiting)} need your decision"
-        self.notify("Orchestra run finished", msg + (". Run: orchestra decisions" if waiting else ""))
-        return counts
+    # ------------------------------------------------------------ shipping
+    async def _ship_and_fix(self, merged_before: set[str]) -> None:
+        """Push + draft PR + CI. Red CI becomes a fix card this run picks up, then ship again."""
+        fixes = 0
+        while True:
+            merged_now = {t.id for t in self.store.all() if t.status == "merged"}
+            if self.stop_reason or not (merged_now - merged_before):
+                return
+            merged_before = merged_now  # ship again only after more work merges
+            self.say(None, f"shipping: pushing {self.cfg.integration_branch} and updating the draft PR", "ship")
+            res = await self.shipper.ship(wait_s=self.cfg.ship.ci_wait_minutes * 60)
+            if res.status == "skipped":
+                self.say(None, f"not shipped: {res.note}", "ship")
+                return
+            if res.status == "failed":
+                self.say(None, f"shipping failed: {res.note}", "warn")
+                self.notify("Orchestra: shipping failed", res.note[:300])
+                return
+            names = ", ".join(c.get("name", "?") for c in res.failed)
+            self.pr = {"url": res.pr_url, "number": res.pr_number, "ci": res.ci, "failed": names}
+            verb = "opened" if res.created else "updated"
+            self.say(None, f"draft PR {verb}: {res.pr_url} · CI {res.ci}" + (f" ({names})" if names else "")
+                     + (f" · {res.note}" if res.note else ""), "ship")
+            if res.created:
+                await self._comment_linear_pr(res)
+            if res.ci != "failed":
+                self.notify(f"Orchestra: PR {verb}", f"{res.pr_url}\nCI: {res.ci}", url=res.pr_url)
+            elif fixes >= self.cfg.ship.ci_fix_rounds:
+                self.notify("Orchestra: CI still failing", f"{names} after {fixes} fix round(s)\n{res.pr_url}",
+                            url=res.pr_url)
+            else:
+                fixes += 1
+                card = self._queue_ci_fix(res, await self.shipper.changed_files())
+                self.say(card.id, f"CI failed ({names}) → fix card queued "
+                         f"({fixes}/{self.cfg.ship.ci_fix_rounds})", "ci")
+                self.notify("Orchestra: CI failed", f"{names}\nFix card {card.id} queued\n{res.pr_url}",
+                            url=res.pr_url)
+            # the fix card, or cards answered (or queued) while CI ran: work them, then ship again
+            if self.stop_reason or not self.store.ready_ids():
+                return
+            await self._drain(answers_since=time.time())
+
+    def _queue_ci_fix(self, res: ShipResult, changed: list[str]) -> Task:
+        names = ", ".join(c.get("name", "?") for c in res.failed)
+        logs, seen = [], set()
+        for c in res.failed:
+            key = c.get("run_id") or c.get("name")
+            if key in seen:
+                continue
+            seen.add(key)
+            logs.append(f"### {c.get('name', '?')}" + (f" ({c['workflow']})" if c.get("workflow") else "")
+                        + f"\n{c.get('link', '')}\n```\n{c.get('log', '')}\n```")
+        spec = (f"CI failed on the draft PR {res.pr_url} for these checks: {names}.\n"
+                "Find the cause and fix it in the code (or in a test, if the test itself is wrong). "
+                "Don't skip, weaken or delete checks, and don't edit CI workflow files unless the "
+                "failure is in the workflow itself. The log tails:\n\n" + "\n\n".join(logs))
+        item = {"key": "fix-ci", "title": f"Fix CI: {names}"[:120], "spec": spec,
+                "acceptance_criteria": [f"The failing CI checks pass: {names}", "The local checks still pass"],
+                "non_goals": ["Skipping, disabling or loosening tests or checks", "Unrelated changes"],
+                "files_scope": sorted(set(changed)) + [g for g in self.cfg.test_globs if g not in changed],
+                "depends_on": [], "complexity": "large"}
+        # no edges to open cards: by now they are waiting on you or stuck, and the fix must run
+        (card,), _ = build_tasks({"tasks": [item]}, start=len(self.store.all()) + 1, existing=[])
+        card.source = "ci"
+        self.store.add_task(card)
+        return card
+
+    async def _comment_linear_pr(self, res: ShipResult) -> None:
+        """With [linear].comment, tell each Linear ticket behind the PR's cards about the PR."""
+        if not self.cfg.linear.comment:
+            return
+        cards = {t.id: t for t in self.store.all()}
+        tickets = sorted({cards[i].source.split(":", 1)[1] for i in res.cards
+                          if i in cards and (cards[i].source or "").startswith("linear:")})
+        if not tickets:
+            return
+        try:
+            client = Linear.from_settings(self.cfg.linear)
+            for tk in tickets:
+                issue = await asyncio.to_thread(client.issue, tk)
+                await asyncio.to_thread(client.comment, issue["id"],
+                                        f"Orchestra opened a draft PR for this ticket: {res.pr_url}")
+                self.say(None, f"commented the PR link on {tk}", "ship")
+        except Exception as e:  # a comment must never break the end of a run
+            self.say(None, f"Linear comment skipped: {e}", "warn")
 
     # ------------------------------------------------------------ one attempt
     async def _execute(self, task: Task) -> None:
@@ -316,6 +534,7 @@ class Orchestrator:
             self.store.set_meta(_rounds_key(task.id), None)  # a fresh attempt starts its rounds over
             graph = await self.graph.snapshot(task.id)
         self.store.update(task.id, resume_note=None, used_graph=1 if graph else 0)
+        self._note_model(task.id, pick_worker_model(cfg, task))
         verb = "resuming" if resuming else f"attempt {task.attempts}/{cfg.max_attempts}"
         self.say(task.id, f"{verb} on {pick_worker_model(cfg, task)}: {task.title}"
                  + (" (with code graph)" if graph else "") + f" · slot {self._slots.get(task.id)}")
@@ -631,6 +850,7 @@ class Orchestrator:
         resolve a conflict (the worktree is left mid-merge, the lock released); else None
         (merged, or the attempt failed and was handled)."""
         message = f"{task.id}: {task.title}\n\n{report.get('summary', '')}"
+        failure = None  # handled after the lock is released (triage may run a whole agent)
         async with self.git.merge_lock:
             old = await self.git.head(self.cfg.integration_branch)
             base_before = await self.git.merge_base(wt)
@@ -648,22 +868,23 @@ class Orchestrator:
                     await self.git.squash_onto(wt, old, message)
                     base_before = None
                 else:
-                    return await self._fail_attempt(
-                        task, "Your change conflicted with work merged meanwhile by another task. "
-                        f"Redo it on top of the latest code.\n{out[-1500:]}")
-            self.store.update(task.id, base_commit=old)  # a resumed review must diff against this
-            if base_before != old or self._gated_base(task) != old:
-                # base moved (or gates last passed on another base): re-verify the combined code
-                stats = await self.git.diff_stats(wt, old)
-                diff = await self.git.diff_text(wt, old, limit_chars=None)
-                results = await run_gates(self.cfg, wt, stats, diff, task.files_scope, env=env,
-                                          exempt=task.locked_tests)
-                await self.git.discard_uncommitted(wt)
-                if not all(r.passed for r in results):
-                    return await self._fail_attempt(
-                        task, "After rebasing on newly merged work, checks fail:\n"
-                        + summarize_failures(results))
-            await self.git.fast_forward_integration(wt, old)
+                    failure = ("Your change conflicted with work merged meanwhile by another task. "
+                               f"Redo it on top of the latest code.\n{out[-1500:]}")
+            if failure is None:
+                self.store.update(task.id, base_commit=old)  # a resumed review must diff against this
+                if base_before != old or self._gated_base(task) != old:
+                    # base moved (or gates last passed on another base): re-verify the combined code
+                    stats = await self.git.diff_stats(wt, old)
+                    diff = await self.git.diff_text(wt, old, limit_chars=None)
+                    results = await run_gates(self.cfg, wt, stats, diff, task.files_scope, env=env,
+                                              exempt=task.locked_tests)
+                    await self.git.discard_uncommitted(wt)
+                    if not all(r.passed for r in results):
+                        failure = "After rebasing on newly merged work, checks fail:\n" + summarize_failures(results)
+            if failure is None:
+                await self.git.fast_forward_integration(wt, old)
+        if failure is not None:
+            return await self._fail_attempt(task, failure)
         self.store.update(task.id, status="merged", summary=report.get("summary", ""))
         self.say(task.id, f"merged into {self.cfg.integration_branch}", "merged")
         await self.git.remove_worktree(task.id, task.branch)
@@ -673,13 +894,17 @@ class Orchestrator:
         return None
 
     # ------------------------------------------------------------ outcomes
-    async def _fail_attempt(self, task: Task, reason: str) -> None:
+    async def _fail_attempt(self, task: Task, reason: str, triage: bool = True) -> None:
         task = self.store.get(task.id)
         self.store.add_feedback(task.id, reason)
         await self.git.remove_worktree(task.id, task.branch)
         if task.attempts >= self.cfg.max_attempts:
+            self.store.update(task.id, worktree=None, session_id=None)
+            handled, note = await self._triage(task, reason) if triage else (False, "")
+            if handled:
+                return
             self.store.update(task.id, status="blocked", worktree=None, session_id=None)
-            self.notify(f"Orchestra: {task.id} blocked", reason[:200])
+            self.notify(f"Orchestra: {task.id} blocked", (note or reason)[:300])
             self.say(task.id, f"blocked after {task.attempts} attempts — needs a human. "
                      f"Last reason: {reason[:300]}", "blocked")
         else:
@@ -689,8 +914,12 @@ class Orchestrator:
     async def _block(self, task: Task, reason: str) -> None:
         self.store.add_feedback(task.id, reason)
         await self.git.remove_worktree(task.id, task.branch)
+        self.store.update(task.id, worktree=None, session_id=None)
+        handled, note = await self._triage(task, reason)
+        if handled:
+            return
         self.store.update(task.id, status="blocked", worktree=None, session_id=None)
-        self.notify(f"Orchestra: {task.id} blocked", reason[:200])
+        self.notify(f"Orchestra: {task.id} blocked", (note or reason)[:300])
         self.say(task.id, f"blocked — needs a human: {reason[:300]}", "blocked")
 
     async def _ask(self, task: Task, report: dict) -> None:
@@ -701,7 +930,229 @@ class Orchestrator:
                     "work_so_far": report.get("summary", "")}
         self.store.update(task.id, status="waiting", decision=decision)
         self.say(task.id, f"needs your decision: {decision['question'][:200]}", "decision")
-        self.notify(f"Orchestra: {task.id} needs a decision", decision["question"][:200])
+        notify(self.cfg.notify_cmd, f"Orchestra: {task.id} needs a decision", decision["question"][:200])
+        self._push_question(task.id)
+
+    def _push_question(self, task_id: str) -> None:
+        """Send a waiting card's question to the phone, with answer buttons. Marked as sent
+        only once it was delivered, so a failed push is retried on the next run."""
+        if not self.ntfy:
+            return
+        t = self.store.get(task_id)
+        if t.status != "waiting" or not t.decision:
+            return
+        tag = question_tag(str(self.cfg.repo), t.id, t.decision)
+        title, message, actions = self.ntfy.question(t.id, t.title, t.decision, tag=tag)
+
+        async def push() -> None:
+            await self.ntfy.publish(title, message, actions=actions, priority=4, tags=["question"])
+            cur = self.store.get(task_id)
+            if cur.decision and cur.decision.get("asked_at") == t.decision.get("asked_at"):
+                self.store.update(task_id, decision={**cur.decision, "pushed_at": time.time()})
+        self._spawn(push(), "ntfy question")
+
+    # ------------------------------------------------------------ triage
+    def _note_model(self, task_id: str, model: str) -> None:
+        key = f"ran_on:{task_id}"
+        ran = self.store.get_meta(key, []) or []
+        if model not in ran:
+            self.store.set_meta(key, ran + [model])
+
+    async def _triage(self, task: Task, reason: str) -> tuple[bool, str]:
+        """Before a card is blocked: one read-only agent picks rewrite / escalate / split /
+        human. Returns (handled, note for the human). Once per card; never past the budget."""
+        cfg = self.cfg
+        task = self.store.get(task.id)
+        if (not cfg.autonomy.triage or task.triaged or self.stop_reason
+                or not callable(getattr(self.runner, "triage", None))
+                or self.run_spent() >= cfg.total_budget_usd):
+            return False, ""
+        if self.limits.paused:  # don't spend the one triage on a limit; try again next run
+            self._defer_triage(task.id)
+            return False, ""
+        self.say(task.id, "triaging before it is blocked…", "triage")
+        context = self._triage_context(task, reason)
+        async with self._triage_lock:  # one shared read-only worktree at the integration head
+            cwd = await self.git.detached_worktree("_triage", cfg.integration_branch)
+            res = await self.runner.triage(cfg, task, context, cwd=cwd)
+        self.store.add_cost(task.id, res.cost_usd, res.tokens)
+        if not res.ok:
+            if res.limited:
+                self.limits.pause(res.resets_at)
+                self._defer_triage(task.id)
+            self.say(task.id, f"triage failed: {res.error[:200]}", "warn")
+            return False, ""
+        self.store.update(task.id, triaged=True)
+        data = res.data
+        action = data.get("action") or "human"
+        why = (data.get("reason") or "").strip()
+        note = (data.get("note_for_human") or why).strip()
+        if action != "human" and action not in cfg.autonomy.triage_actions:
+            note = f"triage suggests {action} ({why}), which needs your approval. {note}"
+            action = "human"
+        msg = None
+        try:
+            if action == "rewrite":
+                msg = self._triage_rewrite(task, data, why)
+            elif action == "escalate":
+                msg = self._triage_escalate(task, data, why)
+            elif action == "split":
+                msg = self._triage_split(task, data, why)
+        except TriageRejected as e:
+            note = f"triage wanted to {action}, but {e}. {note}"
+        self.store.log(task.id, "triage", f"{action}{' (not applied)' if msg is None and action != 'human' else ''}: {why}")
+        if msg is None:
+            self.store.add_feedback(task.id, f"Triage note for the human lead: {note}")
+            self.say(task.id, f"triage: needs you — {note[:300]}", "triage")
+            return False, f"Triage: {note}"
+        self.say(task.id, f"triage → {msg}", "triage")
+        self.notify(f"Orchestra: {task.id} triaged", f"{msg}\nWhy: {why}"[:300])
+        return True, ""
+
+    def _defer_triage(self, task_id: str) -> None:
+        later = self.store.get_meta("triage_later", []) or []
+        if task_id not in later:
+            self.store.set_meta("triage_later", later + [task_id])
+            self.say(task_id, "usage limit: triage postponed to the next run", "triage")
+
+    async def _retriage_deferred(self) -> None:
+        """Cards blocked while a usage limit stopped their triage get it now."""
+        later = self.store.get_meta("triage_later", []) or []
+        if not later:
+            return
+        self.store.set_meta("triage_later", [])
+        for tid in later:
+            try:
+                t = self.store.get(tid)
+            except KeyError:
+                continue
+            if t.status == "blocked" and not t.triaged:
+                reason = t.feedback[-1] if t.feedback else "blocked"
+                handled, note = await self._triage(t, reason)
+                if not handled and self.store.get(tid).triaged:  # triage says: needs you
+                    self.notify(f"Orchestra: {tid} blocked", (note or reason)[:300])
+
+    def _triage_context(self, task: Task, reason: str) -> str:
+        cfg = self.cfg
+        parts = [task_card(replace(task, feedback=[])),
+                 f"## Why it is about to be blocked\n{reason[:3000]}"]
+        if task.feedback:
+            parts.append("## Feedback on this card (oldest first)\n" + "\n\n".join(
+                f"### Note {i + 1}\n{f[:1500]}" for i, f in enumerate(task.feedback[-8:])))
+        ran = self.store.get_meta(f"ran_on:{task.id}", []) or [pick_worker_model(cfg, task)]
+        parts.append(f"## History\nAttempts used: {task.attempts} of {cfg.max_attempts}. Worker models "
+                     f"used: {', '.join(ran)}. Cost so far: ${task.cost_usd:.2f}. Test-first: {task.test_first}.")
+        events = list(reversed(self.store.events(task.id, 30)))
+        if events:
+            parts.append("## Recent events\n" + "\n".join(f"- {e['kind']}: {(e['detail'] or '')[:200]}"
+                                                          for e in events))
+        handoffs = sorted(self.handoff_dir.glob(f"{task.id}.attempt*.json"),
+                          key=lambda p: int("".join(c for c in p.stem.rsplit("attempt", 1)[-1] if c.isdigit()) or 0))
+        if handoffs:
+            parts.append(f"## Last handoff (work report and review)\n```json\n"
+                         f"{handoffs[-1].read_text()[:4000]}\n```")
+        others = [t for t in self.store.open_tasks() if t.id != task.id][:15]
+        if others:
+            parts.append("## Other open cards (avoid their files)\n" + "\n".join(
+                f"- {t.id} [{t.status}] {t.title} — scope: {', '.join(t.files_scope) or 'unrestricted'}"
+                for t in others))
+        allowed = [a for a in ("rewrite", "escalate", "split") if a in cfg.autonomy.triage_actions]
+        parts.append(f"## Allowed actions\n{', '.join(allowed + ['human'])}")
+        return "\n\n".join(parts)
+
+    def _dependents(self, task_id: str, tasks: dict[str, Task]) -> set[str]:
+        """Cards that depend on `task_id`, directly or through other cards."""
+        out: set[str] = set()
+        frontier = [task_id]
+        while frontier:
+            cur = frontier.pop()
+            for t in tasks.values():
+                if cur in t.depends_on and t.id not in out:
+                    out.add(t.id)
+                    frontier.append(t.id)
+        return out
+
+    def _requeue_fields(self) -> dict:
+        return {"status": "pending", "attempts": 0, "worktree": None, "session_id": None, "resume_note": None}
+
+    def _triage_rewrite(self, task: Task, data: dict, why: str) -> str:
+        card = data.get("card") or {}
+        fields: dict = {}
+        for src, dst in (("title", "title"), ("spec", "spec"), ("acceptance_criteria", "acceptance"),
+                         ("non_goals", "non_goals"), ("files_scope", "files_scope")):
+            v = card.get(src)
+            if dst in ("title", "spec"):
+                if isinstance(v, str) and v.strip():
+                    fields[dst] = v.strip()
+            elif isinstance(v, list) and v and all(isinstance(x, str) for x in v):
+                fields[dst] = v  # an empty files_scope would mean "anything": treated as unchanged
+        fields = {k: v for k, v in fields.items() if v != getattr(task, k)}
+        regenerate = bool(task.test_first and task.locked_tests and card.get("regenerate_tests"))
+        if not fields and not regenerate:
+            raise TriageRejected("its rewrite changed nothing")
+        update = {**fields, **self._requeue_fields()}
+        if task.test_first and ("acceptance" in fields or "spec" in fields or regenerate):
+            update["locked_tests"] = []  # the locked tests were written for the old criteria
+            (self.handoff_dir / f"{task.id}.tests.patch").unlink(missing_ok=True)
+            shutil.rmtree(self._lock_dir(task), ignore_errors=True)
+        self.store.update(task.id, **update)
+        changed = sorted(fields) + (["acceptance tests rewritten"] if regenerate and not fields else [])
+        self.store.add_feedback(task.id, f"Triage rewrote this card ({', '.join(changed)}): {why}")
+        added = self._serialize_against_open(task.id, fields["files_scope"]) if "files_scope" in fields else []
+        return f"rewritten ({', '.join(changed)})" + (f"; now waits for {', '.join(added)}" if added else "")
+
+    def _serialize_against_open(self, task_id: str, scope: list[str]) -> list[str]:
+        """After a scope change: wait for open cards that touch the same files (never for a
+        card that waits on this one, so no cycle)."""
+        tasks = {t.id: t for t in self.store.all()}
+        me, dependents = tasks[task_id], self._dependents(task_id, tasks)
+        added = [t.id for t in tasks.values()
+                 if t.id != task_id and t.status in OPEN_STATUSES and t.id not in dependents
+                 and t.id not in me.depends_on and _scopes_overlap(t.files_scope, scope)]
+        if added:
+            self.store.update(task_id, depends_on=me.depends_on + added)
+        return added
+
+    def _triage_escalate(self, task: Task, data: dict, why: str) -> str:
+        target = (data.get("model") or "").strip() or "opus"
+        ran = {model_family(m) for m in (self.store.get_meta(f"ran_on:{task.id}", []) or [])}
+        ran.add(model_family(pick_worker_model(self.cfg, task)))
+        if model_family(target) in ran:
+            raise TriageRejected(f"{task.id} already ran on {model_family(target)}")
+        self.store.update(task.id, model=target, **self._requeue_fields())
+        self.store.add_feedback(task.id, f"Triage moved this card to {target}: {why}")
+        return f"retrying on {target}"
+
+    def _triage_split(self, task: Task, data: dict, why: str) -> str:
+        items = data.get("cards") or []
+        if not isinstance(items, list) or len(items) < 2:
+            raise TriageRejected("a split needs at least two cards")
+        tasks = {t.id: t for t in self.store.all()}
+        dependents = self._dependents(task.id, tasks)
+        existing = [t for t in self.store.open_tasks() if t.id != task.id and t.id not in dependents]
+        try:
+            new, _ = build_tasks({"tasks": items}, start=len(tasks) + 1, existing=existing)
+        except (PlanError, KeyError, TypeError, AttributeError) as e:
+            raise TriageRejected(f"its split was invalid ({e})") from None
+        if task.files_scope:
+            outside = [f"{n.title}: {p}" for n in new for p in (n.files_scope or ["(unrestricted)"])
+                       if not in_scope(p, task.files_scope)]
+            if outside:
+                raise TriageRejected("the split reaches outside the card's files_scope ("
+                                     + "; ".join(outside[:3]) + ")")
+        ids = [n.id for n in new]
+        for n in new:
+            n.depends_on = list(dict.fromkeys(n.depends_on + task.depends_on))
+            n.test_first, n.source, n.triaged = task.test_first, task.source, True
+            n.model = n.model or task.model
+            self.store.add_task(n)
+            self.store.add_feedback(n.id, f"Split from {task.id} by triage: {why}")
+        for t in tasks.values():
+            if task.id in t.depends_on:
+                self.store.update(t.id, depends_on=[d for d in t.depends_on if d != task.id] + ids)
+        self.store.update(task.id, status="cancelled", summary=f"split into {', '.join(ids)}",
+                          worktree=None, session_id=None, resume_note=None)
+        return f"split into {', '.join(ids)}"
 
     async def _pause_for_limit(self, task: Task, res, stage: str | None = None) -> None:
         task = self.store.get(task.id)

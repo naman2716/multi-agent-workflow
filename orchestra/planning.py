@@ -146,9 +146,10 @@ def build_tasks(plan: dict, id_prefix: str = "T", start: int = 1, graph=None,
     return tasks, warnings
 
 
-def save_plan(path: Path, goal: str, plan: dict) -> None:
+def save_plan(path: Path, goal: str, plan: dict, source: dict | None = None) -> None:
+    """`source` records where the goal came from, e.g. {"linear": "ENG-123", "url": ...}."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"goal": goal, **plan}, indent=2))
+    path.write_text(json.dumps({"goal": goal, **({"source": source} if source else {}), **plan}, indent=2))
 
 
 def render_plan(tasks: list[Task], warnings: list[str], plan: dict) -> str:

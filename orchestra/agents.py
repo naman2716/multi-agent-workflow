@@ -1,8 +1,12 @@
-"""The three agent roles, each a fresh Agent SDK session with a structured contract.
+"""The agent roles, each a fresh Agent SDK session with a structured contract.
 
   Planner  - read-only; turns a goal into a dependency graph of small, scoped tasks.
+  Critic   - read-only; checks the plan and returns a corrected one.
   Worker   - edits files inside one worktree; reports a structured handoff.
-  Reviewer - read-only, separate context; judges the diff against the task spec.
+  Test writer - writes locked acceptance tests before the worker (test-first cards).
+  Reviewer - separate context, no edits; judges the diff against the task spec.
+  Validator - checks one blocking review finding.
+  Triage   - read-only; before a card is blocked, picks rewrite / escalate / split / human.
 
 Every agent returns JSON validated against a schema (`output_format`), so the
 orchestrator treats each output as a *candidate* to check, never as prose to trust.
@@ -125,6 +129,35 @@ TESTS_SCHEMA = {
     "required": ["status", "test_files", "covered", "assumptions", "blocker"],
 }
 
+TRIAGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {"type": "string", "enum": ["rewrite", "escalate", "split", "human"]},
+        "reason": {"type": "string", "description": "why the card failed and why this action fixes it"},
+        "card": {
+            "type": "object",
+            "description": "rewrite only: the fields to replace (omit fields that stay the same)",
+            "properties": {
+                "title": {"type": "string"},
+                "spec": {"type": "string"},
+                "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
+                "non_goals": {"type": "array", "items": {"type": "string"}},
+                "files_scope": {"type": "array", "items": {"type": "string"}},
+                "regenerate_tests": {"type": "boolean", "description":
+                                     "test-first cards: true if a locked acceptance test is wrong and "
+                                     "must be written again"},
+            },
+        },
+        "model": {"type": "string", "description": "escalate only: the stronger model, e.g. opus"},
+        "cards": {"type": "array", "description": "split only: 2-4 smaller cards, inside the original "
+                  "files_scope; depends_on uses their keys",
+                  "items": PLAN_SCHEMA["properties"]["tasks"]["items"]},
+        "note_for_human": {"type": "string", "description":
+                           "one or two sentences for the human lead: what is wrong and what they should decide"},
+    },
+    "required": ["action", "reason", "note_for_human"],
+}
+
 CRITIC_SCHEMA = {
     "type": "object",
     "properties": {
@@ -171,6 +204,25 @@ Check it against the goal and the actual repository (read-only):
 - test_first is set on cards changing money, stored data or auth/permissions.
 Return verdict "ok" with the plan unchanged if it is sound; otherwise "revise", list each
 problem with its fix, and return the full corrected plan (same keys where cards are unchanged)."""
+
+TRIAGE_SYSTEM = """You triage a task card in a multi-agent coding system that is about to be
+marked blocked: its attempts are used up, or its worker reported it can't proceed. Read the card,
+its history and the repository (read-only), find the real cause, and choose ONE action:
+- rewrite: the card is unclear, contradictory, mis-scoped (files_scope misses files the work must
+  touch) or its criteria can't be tested, and the repository shows how to fix that. Return only the
+  fields that change. Keep the card's intent; never add features beyond it.
+- escalate: the card is clear and right-sized, but the worker model kept getting it wrong
+  (subtle bugs, wrong approach each time). Name a stronger model (usually opus).
+- split: the card is too big for one reviewable diff (diff-size failures, partial work each time).
+  Return 2-4 smaller cards in the plan format, every files_scope inside the original card's
+  files_scope, ordered with depends_on (by key). Together they must cover the original card.
+- human: anything a rewrite can't fix: a product or business decision, missing access, secrets
+  or services, a broken environment or flaky tests, or a card that should not be done.
+For a test-first card, changing the spec or acceptance criteria also discards its locked
+acceptance tests so they are written again; if a locked test itself is wrong, fix the criterion
+it came from or set regenerate_tests.
+Prefer the smallest change that would make the next attempt succeed. If no automatic action is
+clearly right, choose human. Always write note_for_human."""
 
 WORKER_APPEND = """
 You are a worker agent in a multi-agent orchestrator. You own exactly ONE task card.
@@ -397,6 +449,8 @@ class Runner(Protocol):
                      env: dict | None = None) -> AgentResult: ...
     async def validate(self, cfg: Config, task: Task, worktree: Path, diff: str, finding: dict,
                        env: dict | None = None) -> AgentResult: ...
+    async def triage(self, cfg: Config, task: Task, context: str, cwd: Path,
+                     graph: Path | None = None) -> AgentResult: ...
 
 
 def _graph_opts(cfg: Config, graph: Path | None, base_tools: list[str]) -> tuple[dict, list[str], str]:
@@ -578,6 +632,23 @@ class ClaudeRunner:
         opts = self._checker_options(cfg, worktree, None, cfg.validator_model, VALIDATOR_SYSTEM,
                                      VALIDATE_SCHEMA, env, max_turns=25)
         return await self._run(prompt, opts, f"{task.id}:validate")
+
+    async def triage(self, cfg: Config, task: Task, context: str, cwd: Path,
+                     graph: Path | None = None) -> AgentResult:
+        """Read-only look at a card that is about to be blocked; returns one action."""
+        from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
+        base = ["Read", "Glob", "Grep"]
+        servers, allowed, guide = _graph_opts(cfg, graph, base)
+        opts = ClaudeAgentOptions(
+            cwd=str(cwd), model=cfg.planner_model,
+            system_prompt=TRIAGE_SYSTEM + guide + _context(cfg),
+            tools=base, allowed_tools=allowed, mcp_servers=servers, strict_mcp_config=True,
+            setting_sources=["project"], max_turns=30, session_id=_new_session(),
+            max_budget_usd=cfg.task_budget_usd, env=agent_env(),
+            hooks={"PreToolUse": [HookMatcher(hooks=[make_read_guard(Path(cwd))])]},
+            output_format={"type": "json_schema", "schema": TRIAGE_SCHEMA},
+        )
+        return await self._run(context + "\n\nInvestigate, then choose the action.", opts, f"{task.id}:triage")
 
     async def critique_plan(self, cfg: Config, goal: str, plan: dict, cwd: Path | None = None,
                             graph: Path | None = None) -> AgentResult:
