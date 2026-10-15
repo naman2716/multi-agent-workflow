@@ -431,6 +431,14 @@ the PR opens. In Claude Code, `/groom ENG-123` reads the ticket the same way.
 
 ## Planning
 
+**The integration branch follows the base branch.** `orchestra run`, `plan`, `approve` and `add`
+compare your local `base_branch` with the integration branch. If integration is behind (say you
+committed an addendum to `main` after it was cut), it is fast-forwarded and the run says so.
+Nothing is fetched from `origin`, and a branch checked out somewhere is only reported. If the two
+have diverged, the command stops and says how many commits are on each side. When `main` already
+has everything integration has (a squash-merged PR), it gives the reset command. Pass
+`--allow-diverged` to go ahead anyway. While a run is live, `approve` and `add` only report.
+
 `orchestra plan` drafts against the integration branch (in a read-only `_plan` worktree, or the
 graph worktree), not your checkout. A critic agent (`[planning].critic`) checks coverage, paths,
 ordering, card size, criteria and `test_first`, and its corrected plan replaces the draft when it

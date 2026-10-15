@@ -104,6 +104,7 @@ class Orchestrator:
         self.git = Git(cfg.repo, cfg.worktree_root, cfg.base_branch, cfg.integration_branch, cfg.git)
         self.handoff_dir = cfg.state_path / "handoffs"
         self.stop_reason = ""
+        self.allow_diverged = False  # run on an integration branch that has diverged from base
         self.graph = Graph(cfg.repo, cfg.worktree_root, cfg.integration_branch, cfg.state_path,
                            cfg.graph, log=lambda m: self.say(None, m))
         self.limits = UsageLimits(cfg.limits, log=lambda m: self.say(None, m, "limit"))
@@ -314,7 +315,9 @@ class Orchestrator:
     async def _run(self) -> dict[str, int]:
         self._start_cost = self.store.total_cost()
         started = self._run_started = time.time()
-        await self.git.ensure_integration_branch()
+        sync = await self.git.sync_integration(allow_diverged=self.allow_diverged)  # SyncError: stop
+        if msg := sync.message(self.cfg.base_branch, self.cfg.integration_branch):
+            self.say(None, msg, "sync")
         await self._recover()
         if self.cfg.graph.enabled:
             await self.graph.refresh()

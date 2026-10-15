@@ -35,7 +35,7 @@ from pathlib import Path
 
 from .agents import ClaudeRunner
 from .config import CONFIG_TEMPLATE, Config, detect_gates, render_gates
-from .gitops import IdentityError, resolve_identity
+from .gitops import IdentityError, SyncError, resolve_identity
 from .graph import Graph, GraphData, graphify_available
 from .orchestrator import Orchestrator
 from .planning import PlanError, build_tasks, plan_fingerprint, render_plan, save_plan
@@ -59,9 +59,24 @@ def _graph(cfg: Config) -> Graph:
                  log=lambda m: print(f"[graph] {m}"))
 
 
-async def cfg_integration(cfg: Config) -> None:
+async def cfg_integration(cfg: Config, allow_diverged: bool = False, move: bool = True,
+                          create: bool = True) -> None:
+    """Bring the integration branch up to the base branch (see Git.sync_integration) and say
+    what changed. Raises SyncError when they have diverged, unless allowed."""
     from .gitops import Git
-    await Git(cfg.repo, cfg.worktree_root, cfg.base_branch, cfg.integration_branch).ensure_integration_branch()
+    res = await Git(cfg.repo, cfg.worktree_root, cfg.base_branch, cfg.integration_branch).sync_integration(
+        allow_diverged=allow_diverged, move=move, create=create)
+    if msg := res.message(cfg.base_branch, cfg.integration_branch):
+        print(f"note: {msg}")
+
+
+def _sync_integration(cfg: Config, store: Store, allow_diverged: bool, create: bool = False) -> None:
+    """approve/add/plan: sync before queueing; with a live run, only report (never move its ref)."""
+    from .gitops import SyncError
+    try:
+        asyncio.run(cfg_integration(cfg, allow_diverged, move=not store.live_lease(), create=create))
+    except SyncError as e:
+        sys.exit(f"Stopped: {e}")
 
 
 def _graph_data(cfg: Config) -> GraphData | None:
@@ -142,7 +157,7 @@ def plan_with_critic(cfg: Config, store: Store, goal: str, runner, verbose: bool
     state: dict = {}
 
     async def _plan():
-        await cfg_integration(cfg)
+        await cfg_integration(cfg, allow_diverged=True, move=False)  # cmd_plan synced it already
         g = _graph(cfg)
         snap = await g.snapshot("planner") if cfg.graph.enabled else None
         cwd = g.wt if snap else await Git(cfg.repo, cfg.worktree_root, cfg.base_branch,
@@ -195,6 +210,7 @@ def cmd_plan(args) -> None:
         print(goal.splitlines()[0])
     elif not goal.strip():
         sys.exit('Give a goal (orchestra plan "...") or a ticket (orchestra plan --linear ENG-123).')
+    _sync_integration(cfg, store, args.allow_diverged, create=True)
     plan, issues, cost, cwd, graph_data = plan_with_critic(cfg, store, goal,
                                                            ClaudeRunner(verbose=args.verbose))
     plan_path = cfg.state_path / "plan.json"
@@ -254,6 +270,7 @@ def cmd_approve(args) -> None:
     plan = json.loads(path.read_text())
     if _already_queued(store, plan, args.force):
         return
+    _sync_integration(cfg, store, args.allow_diverged)
     tasks, warnings = build_tasks(plan, start=len(store.all()) + 1, graph=_graph_data(cfg),
                                   existing=store.open_tasks(), split_at=_split_at(cfg))
     print(render_plan(tasks, warnings, plan))
@@ -272,6 +289,7 @@ def cmd_add(args) -> None:
     items = data if isinstance(data, list) else data.get("tasks", [data])
     if _already_queued(store, {"tasks": items}, args.force):
         return
+    _sync_integration(cfg, store, args.allow_diverged)
     tasks, warnings = build_tasks({"tasks": items}, start=len(store.all()) + 1, graph=_graph_data(cfg),
                                   existing=store.open_tasks(), split_at=_split_at(cfg))
     for w in warnings:
@@ -314,6 +332,7 @@ def cmd_run(args) -> None:
     from .asking import TerminalInput
     orch = Orchestrator(cfg, store, ClaudeRunner(verbose=args.verbose),
                         asker=TerminalInput() if interactive else None)
+    orch.allow_diverged = args.allow_diverged
     if interactive:
         print("Agents' questions will appear here as they come up.")
     try:
@@ -322,6 +341,8 @@ def cmd_run(args) -> None:
         print(f"{e}.\nWatch it with `orchestra status`; only one run works the queue at a time.",
               file=sys.stderr)
         sys.exit(3)
+    except SyncError as e:
+        sys.exit(f"Not started: {e}")
     if orch.pr:
         print(f"\nDraft PR: {orch.pr['url']} (CI {orch.pr['ci']})")
     else:
@@ -754,14 +775,18 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--linear", metavar="TICKET", help="plan from a Linear ticket, e.g. ENG-123")
     s.add_argument("--approve", action="store_true")
     s.add_argument("-v", "--verbose", action="store_true"); s.set_defaults(fn=cmd_plan)
+    s.add_argument("--allow-diverged", action="store_true", help="proceed although the integration branch has diverged from base")
     s = sub.add_parser("approve"); s.add_argument("plan", nargs="?")
     s.add_argument("--force", action="store_true", help="queue even if this plan was queued before")
+    s.add_argument("--allow-diverged", action="store_true", help="proceed although the integration branch has diverged from base")
     s.set_defaults(fn=cmd_approve)
     s = sub.add_parser("add"); s.add_argument("file")
     s.add_argument("--force", action="store_true", help="queue even if these cards were queued before")
+    s.add_argument("--allow-diverged", action="store_true", help="proceed although the integration branch has diverged from base")
     s.set_defaults(fn=cmd_add)
     s = sub.add_parser("run"); s.add_argument("-j", "--concurrency", type=int)
     s.add_argument("--budget", type=float); s.add_argument("-v", "--verbose", action="store_true")
+    s.add_argument("--allow-diverged", action="store_true", help="proceed although the integration branch has diverged from base")
     s.add_argument("--no-ask", action="store_true",
                    help="don't ask questions in this terminal (answer later with orchestra answer)")
     s.add_argument("--no-wait", action="store_true",

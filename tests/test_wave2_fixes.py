@@ -1,6 +1,7 @@
 """Tests for wave-2-fixes: groom sizing, scope from answers, fresh triage on retry, card surgery,
 integration sync, test-writer reuse and size check, data-file hint, detached runs and ship
 resume, and the usage report."""
+import asyncio
 import io
 import json
 import sys
@@ -15,11 +16,12 @@ from orchestra.asking import render_question  # noqa: E402
 from orchestra.cards import clean_scope_paths  # noqa: E402
 from orchestra.config import Config  # noqa: E402
 from orchestra.gates import in_scope  # noqa: E402
+from orchestra.gitops import Git, SyncError  # noqa: E402
 from orchestra.harness import build_files, install_harness, stale_files  # noqa: E402
 from orchestra.orchestrator import Orchestrator  # noqa: E402
 from orchestra.store import Store  # noqa: E402
 from tests.test_decisions_limits import with_session  # noqa: E402
-from tests.test_orchestra import Base, FakeRunner, blocked, done  # noqa: E402
+from tests.test_orchestra import Base, FakeRunner, blocked, done, sh  # noqa: E402
 from tests.test_run_without_you import TriageRunner  # noqa: E402
 
 
@@ -316,6 +318,110 @@ class CardSurgery(Base):
         out, code = cli(self.repo, "split", "T15", str(plan))
         self.assertNotEqual(code, 0)
         self.assertIn("at least two cards", out)
+
+
+class IntegrationSync(Base):
+    """#29/#39/#54: integration was cut at 50422e7 and main moved to d1aa457."""
+
+    def setUp(self):
+        super().setUp()
+        (self.repo / "orchestra.toml").write_text("[graph]\nenabled = false\n")
+        sh("git branch orchestra/integration main", self.repo)
+
+    def sync(self, **kw):
+        g = Git(self.repo, self.cfg.worktree_root, "main", "orchestra/integration")
+        return asyncio.run(g.sync_integration(**kw))
+
+    def commit(self, branch, name, text="x\n"):
+        sh(f"git checkout -q {branch} && printf '{text}' > {name} && git add {name} && "
+           f"git commit -qm {name} && git checkout -q main", self.repo)
+
+    def head(self, ref):
+        return sh(f"git rev-parse {ref}", self.repo).strip()
+
+    def test_up_to_date_and_ahead_are_left_alone(self):
+        self.assertEqual(self.sync().action, "up_to_date")
+        self.commit("orchestra/integration", "merged_card.py")
+        before = self.head("orchestra/integration")
+        self.assertEqual(self.sync().action, "ahead")
+        self.assertEqual(self.head("orchestra/integration"), before)
+
+    def test_behind_is_fast_forwarded(self):
+        old = self.head("orchestra/integration")
+        self.commit("main", "addendum.md")
+        res = self.sync()
+        self.assertEqual((res.action, res.old, res.new), ("fast_forwarded", old, self.head("main")))
+        self.assertEqual(self.head("orchestra/integration"), self.head("main"))
+        self.assertIn("fast-forwarded", res.message("main", "orchestra/integration"))
+
+    def test_report_only_does_not_move(self):
+        self.commit("main", "addendum.md")
+        self.assertEqual(self.sync(move=False).action, "behind")
+        self.assertNotEqual(self.head("orchestra/integration"), self.head("main"))
+
+    def test_a_checked_out_integration_branch_is_not_moved(self):
+        self.commit("main", "addendum.md")
+        wt = self.tmp / "integ-checkout"
+        sh(f"git worktree add -q {wt} orchestra/integration", self.repo)
+        res = self.sync()
+        self.assertEqual(res.action, "behind")
+        self.assertIn("checked out in", res.message("main", "orchestra/integration"))
+
+    def test_diverged_stops_unless_allowed(self):
+        self.commit("orchestra/integration", "card.py")
+        self.commit("main", "hotfix.py")
+        with self.assertRaises(SyncError) as e:
+            self.sync()
+        self.assertIn("1 commit(s) only on orchestra/integration, 1 only on main", str(e.exception))
+        self.assertIn("--allow-diverged", str(e.exception))
+        self.assertEqual(self.sync(allow_diverged=True).action, "diverged")
+
+    def test_squash_merged_pr_is_recognised(self):
+        self.commit("orchestra/integration", "card.py", "y\n")
+        self.commit("main", "hotfix.py")
+        self.commit("main", "card.py", "y\n")  # the same change, squashed onto main as a new commit
+        with self.assertRaises(SyncError) as e:
+            self.sync()
+        self.assertIn("squash-merged", str(e.exception))
+        self.assertIn("git branch -f orchestra/integration main", str(e.exception))
+
+    def test_run_fast_forwards_before_dispatch(self):
+        self.commit("main", "addendum.md", "rules\n")
+        self.add("T15", ["c.py"])
+        runner = FakeRunner({"T15": [done(**{"c.py": "open('addendum.md').read()\n"})]})
+        self.run_orch(runner)
+        self.assertEqual(self.store.get("T15").status, "merged")
+        self.assertEqual(self.integration_file("addendum.md"), "rules\n")
+        self.assertTrue(any(e["kind"] == "sync" and "fast-forwarded" in e["detail"] for e in self.store.events()))
+
+    def test_run_stops_on_diverged(self):
+        self.commit("orchestra/integration", "card.py")
+        self.commit("main", "hotfix.py")
+        self.add("T15", ["c.py"])
+        orch = Orchestrator(self.cfg, self.store, FakeRunner({}), log=self.logs.append)
+        with self.assertRaises(SyncError):
+            asyncio.run(orch.run())
+        self.assertEqual(self.store.get("T15").status, "pending")
+        self.assertIsNone(self.store.live_lease())  # the lease is released
+
+    def test_approve_syncs_refuses_diverged_and_only_reports_under_a_live_run(self):
+        plan = self.tmp / "p.json"
+        plan.write_text(json.dumps({"tasks": [card("a", 100)]}))
+        self.commit("main", "addendum.md")
+        token = self.store.acquire_lease()
+        out, code = cli(self.repo, "approve", str(plan))
+        self.assertIn("is behind main", out)
+        self.assertNotEqual(self.head("orchestra/integration"), self.head("main"))
+        self.store.release_lease(token)
+        out, code = cli(self.repo, "approve", str(plan), "--force")
+        self.assertIn("fast-forwarded", out)
+        self.assertEqual(self.head("orchestra/integration"), self.head("main"))
+        self.commit("orchestra/integration", "card.py")
+        self.commit("main", "hotfix.py")
+        out, code = cli(self.repo, "approve", str(plan), "--force")
+        self.assertNotEqual(code, 0)
+        self.assertIn("have diverged", out)
+        self.assertEqual(cli(self.repo, "approve", str(plan), "--force", "--allow-diverged")[1], 0)
 
 
 if __name__ == "__main__":
