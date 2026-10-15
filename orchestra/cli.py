@@ -396,6 +396,62 @@ def cmd_retry(args) -> None:
     print(f"{args.task} re-queued" + (" (it can be triaged again)." if reset else "."))
 
 
+def _read_list(path: str) -> list[str]:
+    """A JSON list of strings, or one item per non-empty line."""
+    text = Path(path).read_text()
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return [line.strip() for line in text.splitlines() if line.strip()]
+    if not (isinstance(data, list) and all(isinstance(x, str) for x in data)):
+        sys.exit(f"{path}: expected a JSON list of strings, or one item per line")
+    return data
+
+
+def cmd_edit(args) -> None:
+    from .cards import CardError, edit_card
+    cfg = Config.load(_repo(args))
+    store = _store(cfg)
+    try:
+        changes = edit_card(
+            store, args.task, force=args.force, state_dir=cfg.state_dir,
+            handoff_dir=cfg.state_path / "handoffs",
+            depends_on=args.depends_on.split(",") if args.depends_on is not None else None,
+            scope=args.scope, scope_add=args.scope_add, scope_remove=args.scope_remove,
+            acceptance=_read_list(args.acceptance_file) if args.acceptance_file else None,
+            acceptance_add=args.acceptance_add,
+            spec=Path(args.spec_file).read_text() if args.spec_file else None,
+            title=args.title, non_goals=_read_list(args.non_goals_file) if args.non_goals_file else None)
+    except (CardError, KeyError) as e:
+        sys.exit(str(e).strip("'\""))
+    print(f"{args.task}: " + ("; ".join(changes) if changes else "nothing changed"))
+
+
+def cmd_split(args) -> None:
+    from .cards import CardError, check_editable, split_card
+    cfg = Config.load(_repo(args))
+    store = _store(cfg)
+    t = store.get(args.task)
+    data = json.loads(Path(args.file).read_text())
+    items = data if isinstance(data, list) else data.get("tasks", [])
+    try:
+        check_editable(store, t, args.force)
+        if t.status == "cancelled" and not args.force:
+            raise CardError(f"{t.id} is cancelled{f' ({t.summary})' if t.summary else ''}; use --force")
+        ids, notes = split_card(store, t, items, args.why or "split by hand", split_at=_split_at(cfg),
+                                source="human")
+    except CardError as e:
+        sys.exit(str(e))
+    for n in notes:
+        print("note:", n)
+    print(f"{t.id} split into {', '.join(ids)}")
+    for i in ids:
+        c = store.get(i)
+        print(f"  {i} {c.title}" + (f"  (after {', '.join(c.depends_on)})" if c.depends_on else ""))
+    if waiting := [x.id for x in store.all() if any(i in x.depends_on for i in ids) and x.id not in ids]:
+        print(f"now waiting for them: {', '.join(waiting)}")
+
+
 def cmd_model(args) -> None:
     cfg = Config.load(_repo(args))
     store = _store(cfg)
@@ -734,6 +790,22 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--pick", type=int, help="choose option N"); s.add_argument("--recommended", action="store_true")
     s.add_argument("--scope-add", nargs="+", metavar="GLOB", help="also add these paths to the card's files_scope")
     s.set_defaults(fn=cmd_answer)
+    s = sub.add_parser("edit", help="change an open card: dependencies, scope, criteria, spec, title")
+    s.add_argument("task")
+    s.add_argument("--depends-on", metavar="IDS", help="comma-separated card ids ('' for none)")
+    s.add_argument("--scope", nargs="+", metavar="GLOB", help="replace files_scope")
+    s.add_argument("--scope-add", nargs="+", metavar="GLOB"); s.add_argument("--scope-remove", nargs="+", metavar="GLOB")
+    s.add_argument("--acceptance-file", metavar="FILE", help="replace the criteria (JSON list or one per line)")
+    s.add_argument("--acceptance-add", action="append", metavar="TEXT", help="add a criterion (repeatable)")
+    s.add_argument("--spec-file", metavar="FILE"); s.add_argument("--title")
+    s.add_argument("--non-goals-file", metavar="FILE")
+    s.add_argument("--force", action="store_true", help="edit a merged card, or one in a live run")
+    s.set_defaults(fn=cmd_edit)
+    s = sub.add_parser("split", help="split a card into the cards in a plan file (dependents are rewired)")
+    s.add_argument("task"); s.add_argument("file", help='plan file: {"tasks": [...]} or a list of cards')
+    s.add_argument("--why", help="reason, noted on each new card")
+    s.add_argument("--force", action="store_true", help="split a merged or cancelled card, or one in a live run")
+    s.set_defaults(fn=cmd_split)
     s = sub.add_parser("scope", help="add or remove files_scope paths on a card")
     s.add_argument("task"); s.add_argument("--add", nargs="+", metavar="GLOB")
     s.add_argument("--remove", nargs="+", metavar="GLOB")

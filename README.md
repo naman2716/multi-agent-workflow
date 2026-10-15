@@ -179,6 +179,21 @@ You can also skip the planner and queue hand-written cards: `orchestra add cards
 (same fields as a plan task: key, title, spec, acceptance_criteria, non_goals, files_scope,
 depends_on, complexity).
 
+Fix an open card without touching `state.db`:
+
+```bash
+orchestra edit T16 --depends-on T15,T29          # '' for none; cycles and unknown ids are refused
+orchestra edit T15 --acceptance-file crit.json   # also --acceptance-add, --spec-file, --title,
+                                                 #   --scope / --scope-add / --scope-remove
+orchestra split T15 split.json --why "621 lines" # same path as triage's split
+```
+
+Every edit is logged and noted on the card for the next worker. New criteria or spec on a
+test-first card discard its locked tests. `split` cancels the card as "split into …", and cards
+that waited for it wait for all the new ones. Unlike triage, a hand split may reach outside the
+original scope (it says so), and its cards can be triaged. Merged cards, and cards in a live run,
+need `--force`.
+
 ## Agents ask you when it matters
 
 A worker that hits a choice the card doesn't settle and that affects users, money or data

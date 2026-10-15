@@ -241,5 +241,82 @@ class RetryResetsTriage(Base):
         self.assertEqual(self.block_once().triage_calls, {})
 
 
+class CardSurgery(Base):
+    """Groom transcript 217-222: T15 split by hand, T16 made to wait for T29, T15's criteria cut."""
+
+    def setUp(self):
+        super().setUp()
+        (self.repo / "orchestra.toml").write_text("[graph]\nenabled = false\n")
+        self.add("T15", ["docs/contracts/**"])
+        self.store.update("T15", acceptance=["contracts", "README"])
+        self.add("T16", ["docs/README.md"], deps=["T15"])
+        self.add("T29", ["docs/other.md"])
+
+    def test_edit_depends_on_scope_and_acceptance(self):
+        out, code = cli(self.repo, "edit", "T16", "--depends-on", "T15,T29")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.store.get("T16").depends_on, ["T15", "T29"])
+        crit = self.tmp / "crit.json"
+        crit.write_text(json.dumps(["contracts only"]))
+        cli(self.repo, "edit", "T15", "--acceptance-file", str(crit), "--acceptance-add", "no README")
+        t = self.store.get("T15")
+        self.assertEqual(t.acceptance, ["contracts only", "no README"])
+        self.assertTrue(any(f.startswith("The human lead edited this card: acceptance") for f in t.feedback))
+        cli(self.repo, "edit", "T29", "--scope", "docs/contracts/x.md", "--title", "New title")
+        t29 = self.store.get("T29")
+        self.assertEqual((t29.files_scope, t29.title), (["docs/contracts/x.md"], "New title"))
+        self.assertIn("T15", t29.depends_on)  # now overlaps an open card -> waits for it
+        self.assertEqual([e["kind"] for e in self.store.events("T29") if e["kind"] == "edit"], ["edit"])
+
+    def test_cycles_unknown_ids_and_bad_paths_are_refused(self):
+        for args, msg in ((["T15", "--depends-on", "T16"], "cycle"), (["T16", "--depends-on", "T99"], "unknown"),
+                          (["T16", "--depends-on", "T16"], "unknown"), (["T16", "--scope", "../x"], "repo-relative")):
+            out, code = cli(self.repo, "edit", *args)
+            self.assertNotEqual(code, 0, args)
+            self.assertIn(msg, out)
+        self.assertEqual(self.store.get("T15").depends_on, [])
+
+    def test_merged_and_live_cards_need_force(self):
+        self.store.update("T15", status="merged")
+        self.assertNotEqual(cli(self.repo, "edit", "T15", "--title", "x")[1], 0)
+        self.assertEqual(cli(self.repo, "edit", "T15", "--title", "x", "--force")[1], 0)
+        self.store.update("T16", status="running")
+        self.store.acquire_lease()
+        out, code = cli(self.repo, "edit", "T16", "--title", "y")
+        self.assertNotEqual(code, 0)
+        self.assertIn("live run", out)
+
+    def test_new_criteria_discard_locked_tests(self):
+        handoffs = self.cfg.state_path / "handoffs"
+        handoffs.mkdir(parents=True, exist_ok=True)
+        (handoffs / "T15.tests.patch").write_text("diff")
+        self.store.update("T15", test_first=True, locked_tests=["tests/test_c.py"])
+        cli(self.repo, "edit", "T15", "--acceptance-add", "one more")
+        self.assertEqual(self.store.get("T15").locked_tests, [])
+        self.assertFalse((handoffs / "T15.tests.patch").exists())
+
+    def test_manual_split_rewires_dependents(self):
+        plan = self.tmp / "split.json"
+        plan.write_text(json.dumps({"tasks": [card("a1", 300, ["docs/contracts/a/**"]),
+                                              card("a1b", 200, ["docs/contracts/b/**", "docs/extra.md"], ["a1"])]}))
+        out, code = cli(self.repo, "split", "T15", str(plan), "--why", "621 lines")
+        self.assertEqual(code, 0, out)
+        self.assertIn("T15 split into T04, T05", out)
+        self.assertIn("reaches outside the original files_scope", out)  # a human may widen; it's noted
+        self.assertEqual(self.store.get("T15").status, "cancelled")
+        self.assertEqual(self.store.get("T05").depends_on, ["T04"])
+        self.assertEqual(self.store.get("T16").depends_on, ["T04", "T05"])
+        self.assertFalse(self.store.get("T04").triaged)  # a human's split earns triage
+        self.assertIn("Split from T15 by human: 621 lines", self.store.get("T04").feedback)
+        self.assertNotEqual(cli(self.repo, "split", "T15", str(plan))[1], 0)  # already split
+
+    def test_a_split_needs_two_cards(self):
+        plan = self.tmp / "one.json"
+        plan.write_text(json.dumps([card("only", 100)]))
+        out, code = cli(self.repo, "split", "T15", str(plan))
+        self.assertNotEqual(code, 0)
+        self.assertIn("at least two cards", out)
+
+
 if __name__ == "__main__":
     unittest.main()

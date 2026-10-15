@@ -35,16 +35,15 @@ from typing import Callable
 from .agents import (GATE_FIX_PREFIX, Runner, blocking_findings, check_verdict, drop_refuted,
                      model_family, pick_reviewer_model, pick_worker_model, task_card)
 from .config import Config
-from .gates import GateResult, in_scope, run_gates, summarize_failures
+from .gates import GateResult, run_gates, summarize_failures
 from .asking import LineSource, parse_answer, render_question
-from .cards import MAX_SCOPE_ADD, clean_scope_paths, serialize_against_open
-from .cards import dependents as card_dependents
+from .cards import MAX_SCOPE_ADD, CardError, clean_scope_paths, serialize_against_open, split_card
 from .gitops import Git, HookRejected, clone_into, matches_any, run
 from .graph import Graph, GraphData
 from .limits import UsageLimits, notify
 from .linear import Linear
 from .ntfy import REPLY_HELP, Ntfy, parse_reply, question_tag
-from .planning import PlanError, build_tasks
+from .planning import build_tasks
 from .ship import Shipper, ShipResult
 from .store import OPEN_STATUSES, Store, Task
 
@@ -1167,38 +1166,14 @@ class Orchestrator:
         return f"retrying on {target}"
 
     def _triage_split(self, task: Task, data: dict, why: str) -> str:
-        items = data.get("cards") or []
-        if not isinstance(items, list) or len(items) < 2:
-            raise TriageRejected("a split needs at least two cards")
-        tasks = {t.id: t for t in self.store.all()}
-        dependents = card_dependents(task.id, tasks)
-        existing = [t for t in self.store.open_tasks() if t.id != task.id and t.id not in dependents]
         try:
-            new, notes = build_tasks({"tasks": items}, start=len(tasks) + 1, existing=existing,
-                                     split_at=int(self.cfg.max_diff_lines * self.cfg.split_above))
-        except (PlanError, KeyError, TypeError, AttributeError) as e:
-            raise TriageRejected(f"its split was invalid ({e})") from None
-        if task.files_scope:
-            outside = [f"{n.title}: {p}" for n in new for p in (n.files_scope or ["(unrestricted)"])
-                       if not in_scope(p, task.files_scope)]
-            if outside:
-                raise TriageRejected("the split reaches outside the card's files_scope ("
-                                     + "; ".join(outside[:3]) + ")")
-        ids = [n.id for n in new]
+            ids, notes = split_card(self.store, task, data.get("cards") or [], why,
+                                    split_at=int(self.cfg.max_diff_lines * self.cfg.split_above))
+        except CardError as e:
+            raise TriageRejected(str(e)) from None
         for note in notes:
             if "split threshold" in note:
                 self.say(task.id, f"triage split: {note}", "warn")
-        for n in new:
-            n.depends_on = list(dict.fromkeys(n.depends_on + task.depends_on))
-            n.test_first, n.source, n.triaged = task.test_first, task.source, True
-            n.model = n.model or task.model
-            self.store.add_task(n)
-            self.store.add_feedback(n.id, f"Split from {task.id} by triage: {why}")
-        for t in tasks.values():
-            if task.id in t.depends_on:
-                self.store.update(t.id, depends_on=[d for d in t.depends_on if d != task.id] + ids)
-        self.store.update(task.id, status="cancelled", summary=f"split into {', '.join(ids)}",
-                          worktree=None, session_id=None, resume_note=None)
         return f"split into {', '.join(ids)}"
 
     async def _pause_for_limit(self, task: Task, res, stage: str | None = None) -> None:
