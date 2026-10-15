@@ -89,9 +89,12 @@ references are to `main` at `db0f598`. "Unconfirmed" marks a claim that needs a 
   - A `scope` event records "scope widened by answer: +…".
   - The resume note adds "Your files_scope now also includes: …".
   - If `files_scope` was empty (unrestricted), it stays empty.
-- **Passing the pick through.** `parse_answer` returns the picked option index as well as the
-  text (`asking.py:80-102`), so the terminal and ntfy paths can pass `pick`. The CLI passes
-  `--pick`. A recommendation that equals an option string counts as that pick.
+- **Passing the pick through.** As built: `Store.answer` infers the pick from the answer text,
+  so `parse_answer` keeps its signature. Every channel writes a pick as the option's text, alone
+  or followed by " — note" (`asking.py:80-102`, `cli.py` `--pick`), and a recommendation equal
+  to an option counts as that pick. The CLI also passes `--pick` explicitly. (The Phase 1 draft
+  had `parse_answer` return the index; inferring it covers the terminal, ntfy and CLI paths
+  without changing them.)
 - **Ordering.** After widening, the card is serialized against open cards whose scope overlaps
   the new paths. This is the same rule triage's rewrite uses (`orchestrator.py:1151-1164`), moved
   into `cards.py` so the store-level answer path can call it.
