@@ -513,9 +513,11 @@ it stops and reports blocked instead of writing it all. A diff over `oversize_tr
   returns longer worker Bash output as its head and tail with a `[truncated N chars]` note
   (0 = off).
 - **Where the money went.** `orchestra usage <export-dir>` breaks an export of agent transcripts
-  (`agent-transcripts/<card>/*.jsonl` plus `tasks.json`/`events.json`/`sessions.json` or
-  `state.db`) down by card, role, model and session: tokens, estimated USD, cold starts, resume
-  rounds and large tool outputs.
+  (`agent-transcripts/<card>/*.jsonl` plus `tasks.json`/`events.json`/`sessions.json`,
+  `tasks-full.json`/`events.log`/`sessions.json`, or `state.db`) down by card, role, model and
+  session: tokens, estimated USD, cold starts, resume rounds (including `decision` answers) and
+  large tool outputs. Tool output the Bash cap already cut, and output in your own interactive
+  sessions, isn't counted as over the cap. Cards cancelled before any agent ran fold into one line.
 - **Models:** Opus plans and reviews; Sonnet does `small` tasks, Opus does `large` ones.
 - **Cost:** expect roughly 2–5× a single agent. The live smoke test (1 small task:
   worker + gates + review + merge) cost about $0.18 with Haiku/Sonnet.

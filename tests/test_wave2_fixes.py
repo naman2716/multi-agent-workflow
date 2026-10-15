@@ -627,5 +627,62 @@ class DetachedRuns(Base):
         self.assertIsNone(self.store.get_meta("ship_pending"))
 
 
+class UsageGaps(unittest.TestCase):
+    """The PCME export: decision resumes labelled 'other', 53 already-capped Bash results counted as
+    over the cap, T01-T14 as $0 rows, and tasks-full.json + events.log not read."""
+
+    def setUp(self):
+        import tempfile
+        from tests.test_usage import CARD, enqueue, tool_result, turn, write
+        self.tmp = tempfile.TemporaryDirectory()
+        root = self.root = Path(self.tmp.name) / "export"
+        tr = root / "agent-transcripts"
+        bash = lambda i: {"type": "tool_use", "id": f"b{i}", "name": "Bash", "input": {"command": "pytest"}}  # noqa: E731
+        capped = "head " * 600 + "\n\n[truncated 23497 chars: the middle of this output was cut. Re-run with grep, " \
+            "head or tail, or save it to a file and read parts, if you need it.]\n\n" + "tail " * 1000
+        write(tr / "T17" / "worker.jsonl", [
+            *enqueue(CARD), {"type": "user", "message": {"role": "user", "content": CARD}},
+            *turn("m1", blocks=[bash(1)]), tool_result("b1", capped),
+            *turn("m2", blocks=[bash(2)]), tool_result("b2", "y" * 12_000),
+            *enqueue("The lead answered your question.\nQuestion: widen?\nAnswer: yes"), *turn("m3"),
+            *enqueue("[structured-output-enforce] You MUST call the StructuredOutput tool"), *turn("m4")])
+        write(tr / "groom-dispatch-review-session" / "me.jsonl", [
+            {"type": "user", "message": {"role": "user", "content": "/groom"}},
+            *turn("g1", blocks=[bash(9)]), tool_result("b9", "z" * 20_000)])
+        tasks = [{"id": f"T{i:02d}", "title": f"t{i}", "status": "cancelled", "attempts": 0, "triaged": 0,
+                  "test_first": 0, "cost_usd": 0} for i in range(1, 15)]
+        tasks.append({"id": "T17", "title": "seed", "status": "blocked", "attempts": 1, "triaged": 1,
+                      "test_first": 0, "cost_usd": 0.91})
+        (root / "tasks-full.json").write_text(json.dumps(tasks))
+        (root / "events.log").write_text(
+            "[2026-10-15 02:37:40] #1 T01 created: A1.1\n----\n"
+            "[2026-10-15 09:00:00] #139 T17 triage: triage: needs you — split\nacross two lines\n----\n"
+            "[2026-10-15 09:00:01] #141 T17 blocked: blocked — needs a human\n----\n"
+            "[2026-10-15 09:00:02] #142 - info: run finished\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_report(self):
+        from orchestra import usage
+        events = usage.parse_events_log((self.root / "events.log").read_text())
+        self.assertEqual([e["id"] for e in events], [1, 139, 141, 142])
+        self.assertEqual(events[1]["detail"], "triage: needs you — split\nacross two lines")
+        self.assertIsNone(events[3]["task_id"])
+        r = usage.build(self.root)
+        worker = next(s for s in r.sessions if s.card == "T17")
+        self.assertEqual(worker.resumes, ["decision", "output_enforce"])
+        d = usage.to_dict(r, 8000)
+        cap = d["tool_output_cap"]
+        self.assertEqual((cap["results"], cap["already_capped"], cap["interactive"]), (1, 1, 1))
+        self.assertEqual([c["id"] for c in d["cards"]], ["T17"])
+        self.assertEqual(d["cards"][0]["status"], "blocked")
+        self.assertEqual(d["cards"][0]["blocked"], 1)
+        self.assertEqual(len(d["idle_cancelled"]), 14)
+        text = usage.render(d)
+        self.assertIn("14 cancelled cards with no sessions (T01–T14) not shown.", text)
+        self.assertIn("Not counted: 1 already cut by the Bash cap, 1 in interactive sessions.", text)
+
+
 if __name__ == "__main__":
     unittest.main()

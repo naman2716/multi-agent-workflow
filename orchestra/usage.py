@@ -33,7 +33,12 @@ RESUME_KINDS = (  # how the orchestrator words each message that resumes a sessi
     ("usage_limit", "You were paused by a usage limit."),
     ("interrupted", "The orchestrator was interrupted"),
     ("task_notification", "<task-notification>"),  # the CLI: a background command finished
+    ("decision", "The lead answered your question."),  # Store.answer
+    ("decision", "Decision from the lead"),            # older Orchestra versions
+    ("output_enforce", "[structured-output-enforce]"),  # the SDK insisting on the structured report
 )
+CAP_MARKER = "chars: the middle of this output was cut"  # the Bash output cap's note (guards.py)
+CAP_NOTE_MAX = 200  # a capped result is at most the cap plus its note
 
 
 @dataclass
@@ -92,6 +97,7 @@ class ToolResult:
     tool: str
     path: str
     turns_after: int                   # assistant turns that re-read it from context
+    capped: bool = False               # already cut by Orchestra's Bash output cap
 
 
 @dataclass
@@ -180,9 +186,9 @@ def read_session(path: Path, root: Path, results: list[ToolResult] | None = None
             first_user = first_user or _text(content)
             for b in content if isinstance(content, list) else []:
                 if isinstance(b, dict) and b.get("type") == "tool_result" and results is not None:
-                    tr = ToolResult(len(json.dumps(b.get("content"), ensure_ascii=False)
-                                        if not isinstance(b.get("content"), str) else b["content"]),
-                                    names.get(b.get("tool_use_id"), "?"), rel, 0)
+                    raw = (b["content"] if isinstance(b.get("content"), str)
+                           else json.dumps(b.get("content"), ensure_ascii=False))
+                    tr = ToolResult(len(raw), names.get(b.get("tool_use_id"), "?"), rel, 0, CAP_MARKER in raw)
                     pending.append(tr)
                     results.append(tr)
             continue
@@ -242,10 +248,16 @@ def read_session(path: Path, root: Path, results: list[ToolResult] | None = None
 def _state_rows(root: Path) -> tuple[list[dict], list[dict], list[dict]]:
     """Tasks, events and recorded sessions from the JSON files or state.db, at root or root/state."""
     for d in (root, root / "state"):
+        def load(name):
+            return json.loads((d / name).read_text()) if (d / name).exists() else []
         if (d / "tasks.json").exists():
-            def load(name):
-                return json.loads((d / name).read_text()) if (d / name).exists() else []
             return load("tasks.json"), load("events.json"), load("sessions.json")
+        if (d / "tasks-full.json").exists():  # the export layout: tasks-full.json + events.log
+            tasks = load("tasks-full.json")
+            tasks = tasks.get("tasks", []) if isinstance(tasks, dict) else tasks
+            events = (parse_events_log((d / "events.log").read_text(errors="replace"))
+                      if (d / "events.log").exists() else load("events.json"))
+            return tasks, events, load("sessions.json")
         if (d / "state.db").exists():
             conn = sqlite3.connect(f"file:{d / 'state.db'}?mode=ro", uri=True)
             conn.row_factory = sqlite3.Row
@@ -257,6 +269,28 @@ def _state_rows(root: Path) -> tuple[list[dict], list[dict], list[dict]]:
             finally:
                 conn.close()
     return [], [], []
+
+
+EVENT_RE = re.compile(r"\[([^\]]+)\] #(\d+) (\S+) ([^:\n]+):[ ]?(.*)", re.S)
+
+
+def parse_events_log(text: str) -> list[dict]:
+    """`[YYYY-mm-dd HH:MM:SS] #N T05 kind: detail` blocks separated by `----` lines (an export of
+    the events table); task "-" means none. Times are read as local time."""
+    import time as _time
+    out = []
+    for block in re.split(r"(?m)^----\s*$", text):
+        m = EVENT_RE.match(block.strip())
+        if not m:
+            continue
+        ts, eid, task, kind, detail = m.groups()
+        try:
+            at = _time.mktime(_time.strptime(ts, "%Y-%m-%d %H:%M:%S"))
+        except ValueError:
+            at = 0.0
+        out.append({"id": int(eid), "task_id": None if task == "-" else task, "kind": kind.strip(),
+                    "detail": detail.strip(), "at": at})
+    return out
 
 
 def load_cards(root: Path, tasks: list[dict] | None = None, events: list[dict] | None = None) -> dict[str, Card]:
@@ -354,20 +388,32 @@ def resume_costs(r: Report) -> dict[str, dict]:
 
 
 def cap_what_if(r: Report, cap: int) -> dict:
-    """Tool results over `cap` chars: how much text a cap would cut and how often it was re-read."""
-    over = [t for t in r.results if t.chars > cap]
+    """Agent tool results over `cap` chars: how much text a cap would cut and how often it was
+    re-read. Results the Bash cap already cut (its note, or a Bash result within the cap plus the
+    note's length) and the human's interactive sessions are counted apart."""
+    roles = {s.path: s.role for s in r.sessions}
+    agent = [t for t in r.results if roles.get(t.path) != "interactive"]
+    capped = [t for t in agent if t.capped or (t.tool == "Bash" and cap < t.chars <= cap + CAP_NOTE_MAX)]
+    done = {id(t) for t in capped}
+    over = [t for t in agent if t.chars > cap and id(t) not in done]
     return {"cap": cap, "results": len(over), "chars_cut": sum(t.chars - cap for t in over),
             "context_tokens_cut": sum((t.chars - cap) // 4 * t.turns_after for t in over),
-            "by_tool": {k: sum(1 for t in over if t.tool == k) for k in sorted({t.tool for t in over})}}
+            "by_tool": {k: sum(1 for t in over if t.tool == k) for k in sorted({t.tool for t in over})},
+            "already_capped": len(capped),
+            "interactive": sum(1 for t in r.results if roles.get(t.path) == "interactive" and t.chars > cap)}
 
 
 def to_dict(r: Report, cap: int = 8000) -> dict:
     agents = [s for s in r.sessions if s.role != "interactive"]
     recorded = [c.recorded_usd for c in r.cards.values() if c.recorded_usd is not None]
+    rows = card_rows(r)
+    # cards cancelled before any agent ran (e.g. a plan queued twice) would only be $0 rows
+    idle = [c for c in rows if c["status"] == "cancelled" and not c["sessions"]]
     return {"totals": {**_sum(agents), "recorded_usd": round(sum(recorded), 2) if recorded else None},
             "interactive": _sum([s for s in r.sessions if s.role == "interactive"]),
             "by_role": group(r, lambda s: s.role), "by_model": group(r, lambda s: ",".join(s.models)),
-            "cards": card_rows(r), "resume_rounds": resume_costs(r), "tool_output_cap": cap_what_if(r, cap),
+            "cards": [c for c in rows if c not in idle], "idle_cancelled": [c["id"] for c in idle],
+            "resume_rounds": resume_costs(r), "tool_output_cap": cap_what_if(r, cap),
             "sessions": [{**asdict(s), "tokens": s.tokens, "cache_write": s.cache_write} for s in r.sessions],
             "largest_tool_results": [asdict(t) for t in sorted(r.results, key=lambda t: -t.chars)[:20]]}
 
@@ -415,6 +461,9 @@ def render(d: dict, md: bool = False) -> str:
           " ".join(f"{k[:4]}:{v['sessions']}/{v['turns']}" for k, v in sorted(c["by_role"].items())),
           c["gate_failures"], c["reviews"], c["first_review"], c["revise_rounds"], _fmt(c["resumed_tokens"])]
          for c in d["cards"]], md))
+    if idle := d.get("idle_cancelled"):
+        ids = ", ".join(idle) if len(idle) <= 6 else f"{idle[0]}–{idle[-1]}"
+        out.append(f"\n{len(idle)} cancelled card{'s' if len(idle) != 1 else ''} with no sessions ({ids}) not shown.")
     for title, key in (("By role", "by_role"), ("By model", "by_model")):
         out.append(h(title))
         out.append(_table([key[3:], "sessions", "turns", "tokens", "c.read", "c.write", "cold start", "priced"],
@@ -434,8 +483,11 @@ def render(d: dict, md: bool = False) -> str:
                        for s in sorted(d["sessions"], key=lambda s: -s["tokens"])], md))
     c = d["tool_output_cap"]
     out.append(h(f"Tool output over {c['cap']:,} chars"))
-    out.append(f"{c['results']} results ({c['by_tool']}) · {c['chars_cut']:,} chars over the cap · "
+    out.append(f"{c['results']} agent results ({c['by_tool']}) · {c['chars_cut']:,} chars over the cap · "
                f"~{_fmt(c['context_tokens_cut'])} context tokens if each was re-read on every later turn")
+    if c.get("already_capped") or c.get("interactive"):
+        out.append(f"Not counted: {c.get('already_capped', 0)} already cut by the Bash cap, "
+                   f"{c.get('interactive', 0)} in interactive sessions.")
     out.append(_table(["chars", "tool", "session", "later turns"],
                       [[f"{x['chars']:,}", x["tool"], x["path"][:40], x["turns_after"]]
                        for x in d["largest_tool_results"][:10]], md))
