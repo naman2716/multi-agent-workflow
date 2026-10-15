@@ -141,6 +141,11 @@ main, force-pushes), an Orchestra section in CLAUDE.md, and, with Graphify, its 
 hooks, its git hooks (graph rebuilt on every commit/checkout of your checkout) and an MCP
 server in `.mcp.json`. Existing settings and CLAUDE.md content are merged, never overwritten.
 
+The agent and skill files are generated from this Orchestra version and are usually committed, so
+upgrading Orchestra doesn't change them by itself (`orchestra init` never touches them). After an
+upgrade, run `orchestra harness install` again and commit the result. `orchestra approve` and
+`orchestra run` print a note when the installed files differ from what this version would write.
+
 ### Code knowledge graph (Graphify)
 
 With `[graph] enabled = true` (set automatically by `orchestra init` when Graphify is
@@ -411,6 +416,8 @@ flagged. Ready cards that more work waits on are dispatched first.
 Cards are sized before they run: planner, critic and triage see the real `max_diff_lines` and give
 each card `estimated_lines`; anything above `[quality].split_above` (default 0.7) of the limit
 should be split, and the printed plan flags cards that weren't. Generated or example data counts.
+`/groom` gets the same sizing rules. `orchestra approve` and `add` warn about every card with no
+estimate; set `[planning] require_estimates = true` to refuse such plans instead.
 While a worker runs, a size check after each edit tells it when it nears and passes the limit, so
 it stops and reports blocked instead of writing it all. A diff over `oversize_triage_factor`
 (default 1.5) times the limit goes straight to triage to be split, without a trim round.

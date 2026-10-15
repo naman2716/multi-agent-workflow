@@ -225,6 +225,28 @@ def _split_at(cfg: Config) -> int:
     return int(cfg.max_diff_lines * cfg.split_above)
 
 
+def _refuse_unestimated(cfg: Config, tasks: list[Task]) -> None:
+    """With [planning] require_estimates: exit (nothing queued) if any card has no estimate."""
+    missing = [t.id for t in tasks if t.estimated_lines <= 0]
+    if cfg.planning.require_estimates and missing:
+        sys.exit(f"Not queued: {', '.join(missing)} {'has' if len(missing) == 1 else 'have'} no "
+                 f"estimated_lines and [planning] require_estimates is on. Add estimates (split "
+                 f"anything above {_split_at(cfg)} lines) and approve again.")
+
+
+def _warn_stale_harness(cfg: Config) -> None:
+    from .harness import stale_files
+    try:
+        stale = stale_files(cfg)
+    except Exception:  # a broken check must never stop approve or run
+        return
+    if stale:
+        names = ", ".join(sorted({Path(p).parent.name if p.endswith("SKILL.md") else Path(p).stem
+                                  for p in stale}))
+        print(f"note: harness files differ from this Orchestra ({names}); they're older or were "
+              "edited. Run `orchestra harness install` and commit the result.")
+
+
 def cmd_approve(args) -> None:
     cfg = Config.load(_repo(args))
     store = _store(cfg)
@@ -235,6 +257,8 @@ def cmd_approve(args) -> None:
     tasks, warnings = build_tasks(plan, start=len(store.all()) + 1, graph=_graph_data(cfg),
                                   existing=store.open_tasks(), split_at=_split_at(cfg))
     print(render_plan(tasks, warnings, plan))
+    _refuse_unestimated(cfg, tasks)
+    _warn_stale_harness(cfg)
     source = plan.get("source") if isinstance(plan.get("source"), dict) else None
     _queue(store, tasks, plan, plan.get("goal", ""), source)
     print(f"\nQueued {len(tasks)} tasks.")
@@ -250,9 +274,10 @@ def cmd_add(args) -> None:
         return
     tasks, warnings = build_tasks({"tasks": items}, start=len(store.all()) + 1, graph=_graph_data(cfg),
                                   existing=store.open_tasks(), split_at=_split_at(cfg))
-    _queue(store, tasks, {"tasks": items})
     for w in warnings:
         print("note:", w)
+    _refuse_unestimated(cfg, tasks)
+    _queue(store, tasks, {"tasks": items})
     print(f"Added {', '.join(t.id for t in tasks)}")
 
 
@@ -284,6 +309,7 @@ def cmd_run(args) -> None:
         sys.stdout.reconfigure(line_buffering=True)  # live output when piped (e.g. /dispatch)
     except (AttributeError, ValueError):
         pass
+    _warn_stale_harness(cfg)
     interactive = cfg.ask_in_terminal and not args.no_ask and sys.stdin.isatty()
     from .asking import TerminalInput
     orch = Orchestrator(cfg, store, ClaudeRunner(verbose=args.verbose),

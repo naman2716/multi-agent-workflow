@@ -58,7 +58,7 @@ def build_tasks(plan: dict, id_prefix: str = "T", start: int = 1, graph=None,
     """Validate the plan, assign stable ids, and serialize tasks whose files overlap
     (or, with a code graph, whose code calls into each other) — with each other and with
     `existing` cards still open from earlier plans. With `split_at`, cards estimated above
-    that many changed lines are flagged for splitting.
+    that many changed lines are flagged for splitting, and cards with no estimate are flagged.
 
     Returns (tasks in topological order, warnings)."""
     raw = plan.get("tasks", [])
@@ -139,7 +139,10 @@ def build_tasks(plan: dict, id_prefix: str = "T", start: int = 1, graph=None,
     if split_at:
         for tid in order:
             est = _estimate(by_id[tid])
-            if est > split_at:
+            if est <= 0:
+                warnings.append(f"{tid}: no estimated_lines; estimate it before approving "
+                                f"(split above {split_at} lines)")
+            elif est > split_at:
                 warnings.append(f"{tid}: estimated {est} changed lines, above the {split_at}-line split "
                                 "threshold; split it before approving, or it may fail the diff gate")
 

@@ -122,15 +122,18 @@ any agent writes code. Tight cards are the most important quality gate in the sy
    explicitly out of scope. Ask before guessing.
 2. Explore the code read-only to ground the plan.
 {graph_step}3. Draft cards following these rules:
-   - vertical slices, each reviewable as one small diff (aim under ~300 changed lines);
+   - vertical slices, each reviewable as one small diff that fits the Sizing rules below;
    - `files_scope` specific; cards that could run at the same time must not share files;
    - shared foundations (schema, types, interfaces) first, dependents list them in `depends_on`;
    - acceptance criteria are concrete and testable; `non_goals` name tempting extras;
    - `test_first: true` on cards that change money, stored data or auth/permissions: a separate
      agent writes locked acceptance tests from the criteria before the worker starts, so make
-     those criteria precise. Confirm these flags with the user.
+     those criteria precise. Confirm these flags with the user;
+   - every card has `estimated_lines` (see Sizing); split any card above the threshold before
+     showing it.
    You can delegate a first draft to the `orchestra-planner` subagent, then refine it together.
-4. Show the cards as a short table (id, title, scope, depends on) and iterate with the user.
+4. Show the cards as a short table (id, title, scope, depends on, est. lines) and iterate with
+   the user.
 5. When the user approves, write the plan to `.orchestra/plan.json` in this shape:
 {_plan_format()}
    Add `"goal": "<one-line goal>"` at the top (it becomes the PR title). For a Linear ticket
@@ -138,7 +141,7 @@ any agent writes code. Tight cards are the most important quality gate in the sy
 6. Run `orchestra approve`. It validates the graph, adds dependency edges where scopes overlap
    {"or code is coupled " if graph else ""}and queues the cards. Show its output.
 7. Suggest `/dispatch` to run them.
-""")
+""" + sizing_rules(cfg))
 
     files[".claude/skills/dispatch/SKILL.md"] = _skill(
         "dispatch",
@@ -283,6 +286,19 @@ def _merge_mcp(path: Path, interpreter: str) -> None:
         "type": "stdio", "command": interpreter,
         "args": ["-m", "graphify.serve", "graphify-out/graph.json"]}
     path.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def stale_files(cfg: Config) -> list[str]:
+    """Installed agent and skill files that differ from what this Orchestra would write (with
+    or without the graph). Harness files are usually committed, so an upgrade doesn't reach
+    them until `orchestra harness install` runs again. Files that aren't installed don't count."""
+    fresh = [build_files(cfg, graph=g) for g in (True, False)]
+    out = []
+    for rel in fresh[0]:
+        p = cfg.repo / rel
+        if p.is_file() and all(p.read_text() != f[rel] for f in fresh):
+            out.append(rel)
+    return out
 
 
 def install_harness(cfg: Config, graph: bool = True, git_hooks: bool = True) -> list[str]:

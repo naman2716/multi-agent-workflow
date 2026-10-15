@@ -93,6 +93,7 @@ class EnvSettings:
 @dataclass
 class Planning:
     critic: bool = True          # a critic agent reviews every plan and returns a corrected one
+    require_estimates: bool = False  # approve/add refuse cards without estimated_lines
 
 
 CACHE_TTLS = {"5m": {"FORCE_PROMPT_CACHING_5M": "1"}, "1h": {"ENABLE_PROMPT_CACHING_1H": "1"}, "auto": {}}
@@ -481,6 +482,7 @@ port_span = 100
 
 [planning]
 critic = true              # a critic agent checks each plan and returns a corrected one
+require_estimates = false  # true: approve/add refuse cards without estimated_lines (else a warning)
 
 [agents]
 cache_ttl = "5m"           # prompt-cache lifetime for agent sessions: "5m" (cheaper writes), "1h" or "auto"
