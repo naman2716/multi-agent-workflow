@@ -684,5 +684,18 @@ class UsageGaps(unittest.TestCase):
         self.assertIn("Not counted: 1 already cut by the Bash cap, 1 in interactive sessions.", text)
 
 
+class ReviewerOutputCap(Base):
+    def test_reviewers_and_validators_get_the_bash_cap(self):
+        r, task = CapturingRunner(), Task(id="T1", title="t", spec="s")
+        for call in (lambda: r.review(self.cfg, task, self.repo, "diff", {}, ""),
+                     lambda: r.validate(self.cfg, task, self.repo, "diff", [{"kind": "scope", "text": "y", "detail": "z"}])):
+            asyncio.run(call())
+            bash = [m for m in r.options.hooks["PreToolUse"] if m.matcher == "Bash"]
+            self.assertEqual(len(bash), 1)
+        self.cfg.agents.bash_output_max_chars = 0
+        asyncio.run(r.review(self.cfg, task, self.repo, "diff", {}, ""))
+        self.assertEqual([m for m in r.options.hooks["PreToolUse"] if m.matcher == "Bash"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

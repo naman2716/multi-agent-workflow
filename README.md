@@ -510,8 +510,8 @@ it stops and reports blocked instead of writing it all. A diff over `oversize_tr
 - **Concurrency 2–4.** Rate limits are pooled across all sessions on your account.
 - **`[agents]` cost settings.** `cache_ttl = "5m"` (default) has agent sessions write the prompt
   cache for 5 minutes (1.25× input price) instead of an hour (2×). `bash_output_max_chars = 8000`
-  returns longer worker Bash output as its head and tail with a `[truncated N chars]` note
-  (0 = off).
+  returns longer Bash output (workers, test writers, reviewers, validators) as its head and tail
+  with a `[truncated N chars]` note (0 = off).
 - **Where the money went.** `orchestra usage <export-dir>` breaks an export of agent transcripts
   (`agent-transcripts/<card>/*.jsonl` plus `tasks.json`/`events.json`/`sessions.json`,
   `tasks-full.json`/`events.log`/`sessions.json`, or `state.db`) down by card, role, model and

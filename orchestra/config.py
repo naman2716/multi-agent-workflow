@@ -489,7 +489,7 @@ require_estimates = false  # true: approve/add refuse cards without estimated_li
 
 [agents]
 cache_ttl = "5m"           # prompt-cache lifetime for agent sessions: "5m" (cheaper writes), "1h" or "auto"
-bash_output_max_chars = 8000  # longer Bash output reaches workers as head + tail (0 = off)
+bash_output_max_chars = 8000  # long Bash output reaches every agent as head + tail (0 = off)
 
 [sandbox]
 # Worker shell commands run in Claude Code's OS sandbox (Seatbelt on macOS): writes only in

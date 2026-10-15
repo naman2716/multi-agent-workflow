@@ -722,13 +722,16 @@ class ClaudeRunner:
         servers, allowed, guide = _graph_opts(cfg, graph, base)
         sandbox = sandbox_settings(cfg) if shell else None
         guard = make_reviewer_guard(worktree) if shell else make_read_guard(worktree)
+        pre = [HookMatcher(hooks=[guard])]
+        if shell and cfg.agents.bash_output_max_chars:  # as for workers: head + tail of long output
+            pre.append(HookMatcher(matcher="Bash", hooks=[make_output_cap(cfg.agents.bash_output_max_chars)]))
         return ClaudeAgentOptions(
             cwd=str(worktree), model=model,
             system_prompt=system + (SANDBOX_NOTE if sandbox else "") + guide + _context(cfg),
             tools=base, allowed_tools=allowed, mcp_servers=servers, strict_mcp_config=True,
             setting_sources=["project"], max_turns=max_turns, max_budget_usd=cfg.task_budget_usd,
             session_id=_new_session(), env={**agent_env(cfg), **(env or {})}, sandbox=sandbox,
-            hooks={"PreToolUse": [HookMatcher(hooks=[guard])]},
+            hooks={"PreToolUse": pre},
             output_format={"type": "json_schema", "schema": schema},
         )
 

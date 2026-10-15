@@ -470,7 +470,7 @@ class BashOutputCap(unittest.TestCase):
             asyncio.run(r.work(cfg, task, Path(d)))
             self.assertEqual([m.matcher for m in r.options.hooks["PreToolUse"]], [None, "Bash"])
             asyncio.run(r.review(cfg, task, Path(d), "diff", {}, "log"))
-            self.assertEqual(len(r.options.hooks["PreToolUse"]), 1)       # reviewers unchanged
+            self.assertEqual([m.matcher for m in r.options.hooks["PreToolUse"]], [None, "Bash"])  # reviewers too (wave-2 9b)
             cfg.agents.bash_output_max_chars = 0
             asyncio.run(r.work(cfg, task, Path(d)))
             self.assertEqual(len(r.options.hooks["PreToolUse"]), 1)
