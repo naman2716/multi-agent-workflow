@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Callable
 
 from .agents import (GATE_FIX_PREFIX, Runner, blocking_findings, check_verdict, drop_refuted,
-                     model_family, pick_reviewer_model, pick_worker_model, task_card)
+                     model_family, parent_tests_note, pick_reviewer_model, pick_worker_model, task_card)
 from .config import Config
 from .gates import GateResult, run_gates, summarize_failures
 from .asking import LineSource, parse_answer, render_question
@@ -663,7 +663,9 @@ class Orchestrator:
             self.say(task.id, "saved acceptance tests no longer apply; writing them again", "tests")
 
         started = time.time()
-        res = await self.runner.write_tests(cfg, replace(task, session_id=None), wt, graph=graph, env=env)
+        reference = self._parent_tests(task)
+        res = await self.runner.write_tests(cfg, replace(task, session_id=None, base_commit=base), wt,
+                                            graph=graph, env=env, **({"reference": reference} if reference else {}))
         self._spent(task, res, "test_writer", started)
         if not res.ok:
             if res.limited:
@@ -868,6 +870,14 @@ class Orchestrator:
             self.say(task.id, f"validator failed ({r.error[:120]}); the findings stand", "warn")
         self.say(task.id, f"validated {len(checked)} blocking finding(s): {len(refuted)} refuted", "validate")
         return drop_refuted(verdict, refuted)
+
+    def _parent_tests(self, task: Task) -> str:
+        """A split child of a test-first card: the tests written for its parent, as a start."""
+        parent = self.store.get_meta(f"tests_from:{task.id}")
+        patch = self.handoff_dir / f"{parent}.tests.patch" if parent else None
+        if not (patch and patch.is_file()):
+            return ""
+        return parent_tests_note(parent, patch.read_text(errors="replace"))
 
     def _tests_note(self, task: Task) -> str:
         try:

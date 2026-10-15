@@ -211,6 +211,8 @@ def split_card(store: Store, task: Task, items: list, why: str, split_at: int | 
         n.model = n.model or task.model
         store.add_task(n)
         store.add_feedback(n.id, f"Split from {task.id} by {source}: {why}")
+        if task.test_first:  # its test writer starts from the parent's tests (if they were written)
+            store.set_meta(f"tests_from:{n.id}", task.id)
     for t in tasks.values():
         if task.id in t.depends_on:
             store.update(t.id, depends_on=[d for d in t.depends_on if d != task.id] + ids)

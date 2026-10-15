@@ -214,7 +214,7 @@ class OversizeStopsEarly(Base):
         self.assertIn("Write", matcher.matcher)
         self.assertIn("Bash", matcher.matcher)
         asyncio.run(r.write_tests(self.cfg, task, self.repo))
-        self.assertNotIn("PostToolUse", r.options.hooks)          # test writers aren't size-checked
+        self.assertIn("PostToolUse", r.options.hooks)  # test writers have their own budget (wave-2-fixes 6)
 
     def run_oversized(self, n_lines):
         self.cfg.max_diff_lines = 100

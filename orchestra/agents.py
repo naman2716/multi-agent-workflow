@@ -14,6 +14,7 @@ orchestrator treats each output as a *candidate* to check, never as prose to tru
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -310,6 +311,52 @@ You write the acceptance tests for ONE task card BEFORE anyone implements it.
 Your final answer must be the structured report."""
 
 
+DATA_SUFFIXES = (".json", ".csv", ".tsv", ".yaml", ".yml", ".xml", ".ndjson", ".jsonl")
+DATA_LINES = 300  # a test file with more changed lines than this is treated as data
+
+
+def _patch_files(patch: str) -> list[tuple[str, str, int]]:
+    """(path, that file's part of the diff, changed lines) per file of a `git diff`."""
+    out: list[tuple[str, str, int]] = []
+    for chunk in re.split(r"(?m)^(?=diff --git )", patch):
+        if not chunk.startswith("diff --git "):
+            continue
+        m = re.search(r"(?m)^\+\+\+ b/(.+)$", chunk) or re.search(r"^diff --git a/\S+ b/(.+)$", chunk, re.M)
+        path = m.group(1).strip() if m else "?"
+        changed = sum(1 for line in chunk.splitlines()
+                      if line[:1] in ("+", "-") and not line.startswith(("+++ ", "--- ")))
+        out.append((path, chunk, changed))
+    return out
+
+
+def parent_tests_note(parent_id: str, patch: str, limit_chars: int = 20_000) -> str:
+    """For a card split from a test-first card: the tests its parent's test writer wrote, as a
+    starting point. Test code is shown (up to `limit_chars`); data files only by path and size,
+    so they aren't copied wholesale into each child."""
+    shown, listed = [], []
+    used = 0
+    for path, chunk, changed in _patch_files(patch):
+        if path.lower().endswith(DATA_SUFFIXES) or changed > DATA_LINES:
+            listed.append(f"- {path} ({changed} lines, data: not shown)")
+        elif used + len(chunk) > limit_chars:
+            listed.append(f"- {path} ({changed} lines, not shown: over the size cap)")
+        else:
+            shown.append(chunk.rstrip("\n"))
+            used += len(chunk)
+    if not shown and not listed:
+        return ""
+    parts = [f"## Tests written for {parent_id} before it was split",
+             f"This card was split from {parent_id}, whose acceptance tests were written but not kept. "
+             "Use them as a starting point: keep and adapt the tests that cover this card's criteria, "
+             "drop the rest. Don't copy the data files wholesale: generate large expected data at test "
+             "time, or keep a small hand-trimmed sample."]
+    if listed:
+        parts.append("Files not shown:\n" + "\n".join(listed))
+    if shown:
+        parts.append("```diff\n" + "\n".join(shown) + "\n```")
+    return "\n\n".join(parts)
+
+
 def sizing_rules(cfg: Config) -> str:
     """How big a card may be, from the project's diff gate (planner, critic and triage)."""
     limit = cfg.max_diff_lines
@@ -594,7 +641,8 @@ class ClaudeRunner:
 
     def _editor_options(self, cfg: Config, task: Task, worktree: Path, graph: Path | None,
                         resume: str | None, env: dict | None, model: str, append: str,
-                        schema: dict, locked: list[str] | None = None, stop_gate: bool = False):
+                        schema: dict, locked: list[str] | None = None, stop_gate: bool = False,
+                        size_role: str = "worker"):
         """Options for an agent that edits files in the worktree (worker, test writer)."""
         from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
         from .gates import SIZE_TOOLS, make_size_guard, make_stop_gate
@@ -609,9 +657,15 @@ class ClaudeRunner:
         if stop_gate and cfg.gates_on_stop and fast:
             hooks["Stop"] = [HookMatcher(hooks=[make_stop_gate(fast, worktree, env=env)],
                                          timeout=sum(g.timeout_s for g in fast) + 30)]
-        if stop_gate and task.base_commit:  # workers: hear about size while there's time to stop
-            guard = make_size_guard(worktree, task.base_commit, cfg.max_diff_lines,
-                                    list(cfg.diff_exclude) + list(locked or []))
+        if task.base_commit and (stop_gate or size_role == "test_writer"):
+            # hear about size while there's time to stop: workers against the diff gate, test
+            # writers against their own budget (locked tests don't count toward the gate)
+            if size_role == "test_writer":
+                guard = make_size_guard(worktree, task.base_commit, cfg.test_max_lines or cfg.max_diff_lines,
+                                        list(cfg.diff_exclude), role="test_writer")
+            else:
+                guard = make_size_guard(worktree, task.base_commit, cfg.max_diff_lines,
+                                        list(cfg.diff_exclude) + list(locked or []))
             hooks["PostToolUse"] = [HookMatcher(matcher=SIZE_TOOLS, hooks=[guard], timeout=60)]
         return ClaudeAgentOptions(
             cwd=str(worktree), model=model,
@@ -637,13 +691,16 @@ class ClaudeRunner:
         return await self._run(prompt, opts, task.id)
 
     async def write_tests(self, cfg: Config, task: Task, worktree: Path, graph: Path | None = None,
-                          resume: str | None = None, env: dict | None = None) -> AgentResult:
+                          resume: str | None = None, env: dict | None = None,
+                          reference: str = "") -> AgentResult:
         """Test-first: write failing acceptance tests for the card (its own session id is
-        returned; the caller keeps it separate from the worker's)."""
+        returned; the caller keeps it separate from the worker's). `reference`: tests written
+        for the card this one was split from."""
         opts = self._editor_options(cfg, task, worktree, graph, resume, env, cfg.test_writer_model,
-                                    TEST_WRITER_APPEND, TESTS_SCHEMA)
+                                    TEST_WRITER_APPEND, TESTS_SCHEMA, size_role="test_writer")
         prompt = resume if (resume and task.session_id) else (
-            task_card(task) + "\n\nWrite the acceptance tests for this card now (tests only).")
+            task_card(task) + (f"\n\n{reference.strip()}" if reference.strip() else "")
+            + "\n\nWrite the acceptance tests for this card now (tests only).")
         return await self._run(prompt, opts, f"{task.id}:tests")
 
     def _checker_options(self, cfg: Config, worktree: Path, graph: Path | None, model: str,

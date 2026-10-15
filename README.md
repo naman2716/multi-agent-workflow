@@ -284,6 +284,14 @@ before implementation, the run log and the reviewer get a warning. The reviewer 
 check that the change doesn't stop them from running (skip markers, conftest or test-config
 edits); Orchestra doesn't check that itself.
 
+Since locked tests don't count toward the gate, the test writer gets its own size check: past
+80% of `[quality].test_max_lines` (default `max_diff_lines`), and again past it, it is told to
+cover each criterion once and to generate large expected data at test time. A card that can't be
+tested within the budget is reported blocked and goes to triage, before any worker runs. When
+triage (or `orchestra split`) splits a test-first card whose tests were already written, each new
+card's test writer starts from them: the parent's test code is in its prompt (up to 20k chars),
+and data files are listed by name and size only.
+
 ## Self-healing: triage before a card is blocked
 
 When a card uses up its attempts, or its worker (or test writer) reports it can't proceed, a

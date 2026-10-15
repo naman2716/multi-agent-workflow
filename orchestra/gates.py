@@ -169,7 +169,7 @@ SIZE_WARN_AT = 0.8
 SIZE_TOOLS = "Write|Edit|MultiEdit|NotebookEdit|Bash"
 
 
-def make_size_guard(worktree: Path, base: str, limit: int, exclude: list[str]):
+def make_size_guard(worktree: Path, base: str, limit: int, exclude: list[str], role: str = "worker"):
     """Agent SDK PostToolUse hook for workers: count the change as the diff_size gate will, and
     tell the worker once it nears the limit and again once it passes it, so an oversized card
     stops early (report blocked, get split) instead of being written in full and then trimmed."""
@@ -182,12 +182,20 @@ def make_size_guard(worktree: Path, base: str, limit: int, exclude: list[str]):
             return {}
         if counted > limit and state["warned"] < 1.0:
             state["warned"] = 1.0
-            msg = (f"Size check: your change is now {counted} changed lines; the orchestrator rejects "
+            msg = (f"Size check: your tests are now {counted} changed lines, over the {limit}-line budget "
+                   "for acceptance tests. Stop adding. If data files make them this big, generate that "
+                   "data at test time instead of committing it; if the card can't be tested within the "
+                   "budget, report status \"blocked\" with how you would split the card."
+                   if role == "test_writer" else
+                   f"Size check: your change is now {counted} changed lines; the orchestrator rejects "
                    f"more than {limit}. Stop here and don't trim to fit: report status \"blocked\" "
                    "with the work done so far and how you would split this card into smaller ones.")
         elif counted > limit * SIZE_WARN_AT and state["warned"] < SIZE_WARN_AT:
             state["warned"] = SIZE_WARN_AT
-            msg = (f"Size check: your change is {counted} changed lines, near the {limit}-line limit. "
+            msg = (f"Size check: your tests are {counted} changed lines, near the {limit}-line budget. "
+                   "Cover each criterion once; generate large expected data at test time."
+                   if role == "test_writer" else
+                   f"Size check: your change is {counted} changed lines, near the {limit}-line limit. "
                    "Finish within it; if the card can't fit, report \"blocked\" with how to split it.")
         else:
             return {}

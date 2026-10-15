@@ -11,7 +11,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from orchestra.agents import WORK_SCHEMA, WORKER_APPEND, AgentResult  # noqa: E402
+from orchestra.agents import WORK_SCHEMA, WORKER_APPEND, AgentResult, parent_tests_note  # noqa: E402
+from orchestra.gates import make_size_guard  # noqa: E402
+from orchestra.store import Task  # noqa: E402
 from orchestra.asking import render_question  # noqa: E402
 from orchestra.cards import clean_scope_paths  # noqa: E402
 from orchestra.config import Config  # noqa: E402
@@ -22,7 +24,9 @@ from orchestra.orchestrator import Orchestrator  # noqa: E402
 from orchestra.store import Store  # noqa: E402
 from tests.test_decisions_limits import with_session  # noqa: E402
 from tests.test_orchestra import Base, FakeRunner, blocked, done, sh  # noqa: E402
+from tests.test_keep_good_work import FEE_TEST, tests_done  # noqa: E402
 from tests.test_run_without_you import TriageRunner  # noqa: E402
+from tests.test_spend_less import CapturingRunner, lines  # noqa: E402
 
 
 def card(key, est=None, scope=None, deps=()):
@@ -422,6 +426,82 @@ class IntegrationSync(Base):
         self.assertNotEqual(code, 0)
         self.assertIn("have diverged", out)
         self.assertEqual(cli(self.repo, "approve", str(plan), "--force", "--allow-diverged")[1], 0)
+
+
+BIG_JSON = "[\n" + "".join(f"  {i},\n" for i in range(400)) + "  0\n]\n"
+
+
+class ReferenceRunner(TriageRunner):
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.references = {}
+
+    async def write_tests(self, cfg, task, wt, graph=None, resume=None, env=None, reference=""):
+        self.references[task.id] = reference
+        return await super().write_tests(cfg, task, wt, graph=graph, resume=resume, env=env)
+
+
+class TestWriterReuse(Base):
+    """T20: tests written (2,268 lines, 1,528 of them one JSON fixture), then the card was split and
+    T30-T33's test writers started from nothing."""
+
+    def test_children_of_a_split_test_first_card_get_the_parents_tests(self):
+        self.add("P", ["fee.py", "tests/*"], test_first=True)
+        split = {"action": "split", "reason": "862 lines", "cards": [
+            card("fee-core", 200, ["fee.py", "tests/test_fee.py"]),
+            card("fee-parity", 200, ["tests/test_parity.py"], ["fee-core"])]}
+        fee = done(**{"fee.py": "def fee(x):\n    return x // 10\n"})
+        runner = ReferenceRunner(
+            {"P": [blocked], "T02": [fee], "T03": [done(**{"tests__notes.txt": "n\n"})]},
+            tests={"P": [tests_done(**{"tests/test_fee.py": FEE_TEST, "tests/expected.json": BIG_JSON})],
+                   "T02": [tests_done(**{"tests/test_fee.py": FEE_TEST})],
+                   "T03": [tests_done(**{"tests/test_parity.py": "PARITY = 1\n"})]},
+            triage={"P": split})
+        self.run_orch(runner)
+        self.assertEqual(self.store.get("P").summary, "split into T02, T03")
+        self.assertEqual(runner.references["P"], "")
+        for child in ("T02", "T03"):
+            ref = runner.references[child]
+            self.assertIn("## Tests written for P before it was split", ref)
+            self.assertIn("self.assertEqual(fee(100), 10)", ref)          # test code: shown
+            self.assertIn("tests/expected.json (403 lines, data: not shown)", ref)
+            self.assertNotIn("  399,", ref)                                # data: not copied
+        self.assertEqual(self.store.get("T02").status, "merged")
+
+    def test_children_of_a_card_without_written_tests_get_nothing(self):
+        orch = Orchestrator(self.cfg, self.store, FakeRunner({}), log=self.logs.append)
+        self.add("P", ["fee.py"], test_first=True)
+        orch._triage_split(self.store.get("P"), {"cards": [card("a", 10, ["fee.py"]), card("b", 10, ["fee.py"])]}, "x")
+        self.assertEqual(self.store.get_meta("tests_from:T02"), "P")
+        self.assertEqual(orch._parent_tests(self.store.get("T02")), "")
+
+    def test_note_caps_code_and_lists_data(self):
+        patch = "".join(f"diff --git a/tests/t{i}.py b/tests/t{i}.py\n--- /dev/null\n+++ b/tests/t{i}.py\n"
+                        + "".join(f"+line {j}\n" for j in range(100)) for i in range(5))
+        patch += "diff --git a/tests/fx.csv b/tests/fx.csv\n+++ b/tests/fx.csv\n+a,b\n"
+        note = parent_tests_note("T20", patch, limit_chars=2_500)
+        self.assertIn("+++ b/tests/t0.py", note)
+        self.assertIn("tests/t4.py (100 lines, not shown: over the size cap)", note)
+        self.assertIn("tests/fx.csv (1 lines, data: not shown)", note)
+        self.assertEqual(parent_tests_note("T20", ""), "")
+
+    def test_test_writer_gets_its_own_size_budget(self):
+        self.cfg.test_max_lines = 100
+        base = sh("git rev-parse HEAD", self.repo).strip()
+        hook = make_size_guard(self.repo, base, 100, [], role="test_writer")
+        check = lambda: asyncio.run(hook({}, None, None)).get("hookSpecificOutput", {}).get("additionalContext")  # noqa: E731
+        (self.repo / "expected.json").write_text(lines(90))
+        self.assertIn("near the 100-line budget", check())
+        (self.repo / "more.json").write_text(lines(30))
+        msg = check()
+        self.assertIn("over the 100-line budget for acceptance tests", msg)
+        self.assertIn("generate that data at test time", msg)
+        r = CapturingRunner()
+        asyncio.run(r.write_tests(self.cfg, Task(id="T1", title="t", spec="s", base_commit=base), self.repo,
+                                  reference="## Tests written for T0 before it was split\nx"))
+        self.assertIn("PostToolUse", r.options.hooks)
+        self.assertIn("## Tests written for T0", r.prompt)
+        self.assertTrue(r.prompt.rstrip().endswith("Write the acceptance tests for this card now (tests only)."))
 
 
 if __name__ == "__main__":
