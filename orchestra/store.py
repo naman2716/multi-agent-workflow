@@ -410,21 +410,39 @@ class Store:
     def waiting(self) -> list[Task]:
         return [t for t in self.all() if t.status == "waiting"]
 
-    def answer(self, task_id: str, answer: str) -> Task:
-        """Record the human's decision and send the task back to the queue to resume."""
+    def answer(self, task_id: str, answer: str, pick: int | None = None,
+               scope_add: list[str] | None = None) -> Task:
+        """Record the human's decision and send the task back to the queue to resume.
+
+        `pick` is the chosen option (1-based); without it, an answer that is an option's text
+        (alone or followed by " — note", as every answer channel writes a pick) counts as that
+        option. Paths the picked option lists under the decision's scope_add, plus any
+        `scope_add` given here, are added to the card's files_scope."""
         t = self.get(task_id)
         if t.status != "waiting" or not t.decision:
             raise ValueError(f"{task_id} is not waiting for a decision (status: {t.status})")
         q = t.decision.get("question", "")
+        opts = t.decision.get("options", [])
+        if pick is None:
+            pick = next((i for i, o in enumerate(opts, 1)
+                         if o and (answer == o or answer.startswith(o + " — "))), None)
+        paths = list((t.decision.get("scope_add") or {}).get(str(pick), [])) if pick else []
+        paths += [p for p in scope_add or [] if p not in paths]
+        widened = [p for p in paths if p not in t.files_scope] if t.files_scope else []
         now = time.time()
-        decision = {**t.decision, "answer": answer, "answered_at": now}
+        decision = {**t.decision, "answer": answer, "answered_at": now,
+                    **({"scope_added": widened} if widened else {})}
         note = (f"The lead answered your question.\nQuestion: {q}\nAnswer: {answer}\n"
-                "Continue the task from where you stopped, applying this decision.")
+                + (f"Your files_scope now also includes: {', '.join(widened)}\n" if widened else "")
+                + "Continue the task from where you stopped, applying this decision.")
         # Decisions live in their own list so every later attempt's card shows them.
         decisions = t.decisions + [{"question": q, "answer": answer, "at": now}]
         self.update(task_id, status="pending", decision=decision, decisions=decisions,
                     resume_note=note, attempts=max(t.attempts - 1, 0))  # asking is not a failed attempt
         self.log(task_id, "answered", answer)
+        if widened:
+            from .cards import widen_scope
+            widen_scope(self, task_id, widened, "by answer")
         return self.get(task_id)
 
     def open_tasks(self) -> list[Task]:

@@ -73,6 +73,14 @@ WORK_SCHEMA = {
                 "options": {"type": "array", "items": {"type": "string"}},
                 "recommendation": {"type": "string"},
                 "why_it_matters": {"type": "string"},
+                "scope_add": {
+                    "type": "array",
+                    "description": "files outside files_scope that an option needs, per option",
+                    "items": {"type": "object", "properties": {
+                        "option": {"type": "integer", "description": "1-based option number"},
+                        "paths": {"type": "array", "items": {"type": "string"}}},
+                        "required": ["option", "paths"]},
+                },
             },
             "required": ["question", "options", "recommendation", "why_it_matters"],
         },
@@ -246,8 +254,9 @@ You are a worker agent in a multi-agent orchestrator. You own exactly ONE task c
   depend on (a business rule, pricing, data migration, a public API shape, deleting data),
   do NOT guess: stop early and report status "needs_decision" with one clear question,
   2-4 concrete options, your recommendation, and why it matters. Keep any work done so far;
-  you will resume this same session with the answer. For minor choices (naming, internal
-  structure), decide yourself and mention it in the summary.
+  you will resume this same session with the answer. If an option needs files outside your
+  files_scope, list them under scope_add for that option, so picking it lets you edit them.
+  For minor choices (naming, internal structure), decide yourself and mention it in the summary.
 - If the task is impossible as written (missing access, contradictory requirements),
   report status "blocked" with a precise blocker.
 - Prefer fast, targeted test runs over full suites; don't loop on slow commands.

@@ -207,6 +207,13 @@ question stays readable):
 The agent resumes its own session right away, in the same run. `2: but round up` picks an
 option with a tweak (your note wins where they differ). `later` leaves it open.
 
+**Options that need more files say so.** When an option means editing files outside the card's
+`files_scope` (a model, a migration), the worker lists them and the question shows
+`(adds to scope: …)` after that option. Picking it, from any channel, adds those paths to the
+card, logs it, and makes the card wait for open cards on the same files. To add paths yourself:
+`orchestra answer T17 --pick 1 --scope-add 'backend/alembic/versions/*'`, or
+`orchestra scope T17 --add <glob> [--remove <glob>]` for a card that isn't waiting.
+
 **Elsewhere, it's picked up live.** When the run has no terminal (e.g. started by `/dispatch`
 in Claude Code), it keeps going for up to `decision_wait_minutes` (default 60) after
 everything else is done. Answer from Claude Code (`/dispatch` relays questions as they

@@ -37,12 +37,14 @@ from .agents import (GATE_FIX_PREFIX, Runner, blocking_findings, check_verdict, 
 from .config import Config
 from .gates import GateResult, in_scope, run_gates, summarize_failures
 from .asking import LineSource, parse_answer, render_question
+from .cards import MAX_SCOPE_ADD, clean_scope_paths, serialize_against_open
+from .cards import dependents as card_dependents
 from .gitops import Git, HookRejected, clone_into, matches_any, run
 from .graph import Graph, GraphData
 from .limits import UsageLimits, notify
 from .linear import Linear
 from .ntfy import REPLY_HELP, Ntfy, parse_reply, question_tag
-from .planning import PlanError, _scopes_overlap, build_tasks
+from .planning import PlanError, build_tasks
 from .ship import Shipper, ShipResult
 from .store import OPEN_STATUSES, Store, Task
 
@@ -977,6 +979,21 @@ class Orchestrator:
                     "options": d.get("options", []), "recommendation": d.get("recommendation", ""),
                     "why_it_matters": d.get("why_it_matters", ""), "asked_at": time.time(),
                     "work_so_far": report.get("summary", "")}
+        scope_add, dropped = {}, []
+        for item in d.get("scope_add") or []:
+            try:
+                n = int(item.get("option"))
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if 1 <= n <= len(decision["options"]):
+                ok, bad = clean_scope_paths(item.get("paths") or [], self.cfg.state_dir)
+                dropped += bad + ok[MAX_SCOPE_ADD:]
+                if ok:
+                    scope_add[str(n)] = ok[:MAX_SCOPE_ADD]
+        if scope_add:
+            decision["scope_add"] = scope_add
+        if dropped:
+            self.say(task.id, f"dropped scope paths the question can't grant: {', '.join(dropped)[:200]}", "warn")
         self.store.update(task.id, status="waiting", decision=decision)
         self.say(task.id, f"needs your decision: {decision['question'][:200]}", "decision")
         notify(self.cfg.notify_cmd, f"Orchestra: {task.id} needs a decision", decision["question"][:200])
@@ -1110,18 +1127,6 @@ class Orchestrator:
         parts.append(f"## Allowed actions\n{', '.join(allowed + ['human'])}")
         return "\n\n".join(parts)
 
-    def _dependents(self, task_id: str, tasks: dict[str, Task]) -> set[str]:
-        """Cards that depend on `task_id`, directly or through other cards."""
-        out: set[str] = set()
-        frontier = [task_id]
-        while frontier:
-            cur = frontier.pop()
-            for t in tasks.values():
-                if cur in t.depends_on and t.id not in out:
-                    out.add(t.id)
-                    frontier.append(t.id)
-        return out
-
     def _requeue_fields(self) -> dict:
         return {"status": "pending", "attempts": 0, "worktree": None, "session_id": None, "resume_note": None}
 
@@ -1148,20 +1153,8 @@ class Orchestrator:
         self.store.update(task.id, **update)
         changed = sorted(fields) + (["acceptance tests rewritten"] if regenerate and not fields else [])
         self.store.add_feedback(task.id, f"Triage rewrote this card ({', '.join(changed)}): {why}")
-        added = self._serialize_against_open(task.id, fields["files_scope"]) if "files_scope" in fields else []
+        added = serialize_against_open(self.store, task.id, fields["files_scope"]) if "files_scope" in fields else []
         return f"rewritten ({', '.join(changed)})" + (f"; now waits for {', '.join(added)}" if added else "")
-
-    def _serialize_against_open(self, task_id: str, scope: list[str]) -> list[str]:
-        """After a scope change: wait for open cards that touch the same files (never for a
-        card that waits on this one, so no cycle)."""
-        tasks = {t.id: t for t in self.store.all()}
-        me, dependents = tasks[task_id], self._dependents(task_id, tasks)
-        added = [t.id for t in tasks.values()
-                 if t.id != task_id and t.status in OPEN_STATUSES and t.id not in dependents
-                 and t.id not in me.depends_on and _scopes_overlap(t.files_scope, scope)]
-        if added:
-            self.store.update(task_id, depends_on=me.depends_on + added)
-        return added
 
     def _triage_escalate(self, task: Task, data: dict, why: str) -> str:
         target = (data.get("model") or "").strip() or "opus"
@@ -1178,7 +1171,7 @@ class Orchestrator:
         if not isinstance(items, list) or len(items) < 2:
             raise TriageRejected("a split needs at least two cards")
         tasks = {t.id: t for t in self.store.all()}
-        dependents = self._dependents(task.id, tasks)
+        dependents = card_dependents(task.id, tasks)
         existing = [t for t in self.store.open_tasks() if t.id != task.id and t.id not in dependents]
         try:
             new, notes = build_tasks({"tasks": items}, start=len(tasks) + 1, existing=existing,

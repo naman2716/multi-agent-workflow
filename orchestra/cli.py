@@ -437,8 +437,9 @@ def _print_decision(t) -> None:
     print(f"  Q: {d.get('question', '')}")
     if d.get("why_it_matters"):
         print(f"  why it matters: {d['why_it_matters']}")
+    from .asking import scope_note
     for i, o in enumerate(d.get("options", []), 1):
-        print(f"   {i}. {o}")
+        print(f"   {i}. {o}{scope_note(d, i)}")
     if d.get("recommendation"):
         print(f"  agent recommends: {d['recommendation']}")
     if d.get("work_so_far"):
@@ -476,11 +477,44 @@ def cmd_answer(args) -> None:
         answer = input("\nYour decision: ").strip() if sys.stdin.isatty() else ""
         if not answer:
             sys.exit("no answer given")
+    from .cards import clean_scope_paths
+    extra, bad = clean_scope_paths(args.scope_add or [], cfg.state_dir)
+    if bad:
+        sys.exit(f"--scope-add can't grant {', '.join(bad)}: use repo-relative paths, no '..', "
+                 "nothing under .git/ or the state directory")
     try:
-        store.answer(args.task, answer)
+        before = t.files_scope
+        t = store.answer(args.task, answer, pick=args.pick, scope_add=extra)
     except ValueError as e:
         sys.exit(str(e))
-    print(f"{args.task} will resume with: {answer}\nRun `orchestra run` (or /dispatch) to continue.")
+    print(f"{args.task} will resume with: {answer}")
+    if added := [p for p in t.files_scope if p not in before]:
+        print(f"files_scope now also includes: {', '.join(added)}")
+    print("Run `orchestra run` (or /dispatch) to continue.")
+
+
+def cmd_scope(args) -> None:
+    from .cards import CardError, check_editable, clean_scope_paths, narrow_scope, widen_scope
+    cfg = Config.load(_repo(args))
+    store = _store(cfg)
+    t = store.get(args.task)
+    add, bad = clean_scope_paths(args.add or [], cfg.state_dir)
+    if bad:
+        sys.exit(f"can't add {', '.join(bad)}: use repo-relative paths, no '..', "
+                 "nothing under .git/ or the state directory")
+    try:
+        check_editable(store, t, args.force)
+        removed = narrow_scope(store, t.id, args.remove or [])
+        added = widen_scope(store, t.id, add, "by hand")
+    except CardError as e:
+        sys.exit(str(e))
+    if not t.files_scope and add:
+        print(f"{t.id} has no files_scope (unrestricted); nothing to add.")
+    t = store.get(t.id)
+    print(f"{t.id} scope: {', '.join(t.files_scope) or 'unrestricted'}"
+          + (f"  (+{', '.join(added)})" if added else "") + (f"  (-{', '.join(removed)})" if removed else ""))
+    if t.depends_on:
+        print(f"depends on: {', '.join(t.depends_on)}")
 
 
 def cmd_models(args) -> None:
@@ -693,7 +727,13 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("answer", help="answer an agent's question; it resumes on the next run")
     s.add_argument("task"); s.add_argument("text", nargs="?")
     s.add_argument("--pick", type=int, help="choose option N"); s.add_argument("--recommended", action="store_true")
+    s.add_argument("--scope-add", nargs="+", metavar="GLOB", help="also add these paths to the card's files_scope")
     s.set_defaults(fn=cmd_answer)
+    s = sub.add_parser("scope", help="add or remove files_scope paths on a card")
+    s.add_argument("task"); s.add_argument("--add", nargs="+", metavar="GLOB")
+    s.add_argument("--remove", nargs="+", metavar="GLOB")
+    s.add_argument("--force", action="store_true", help="change a merged card, or one in a live run")
+    s.set_defaults(fn=cmd_scope)
     s = sub.add_parser("models", help="show the model used by each role"); s.set_defaults(fn=cmd_models)
     s = sub.add_parser("graph", help="build/inspect the Graphify code graph")
     s.add_argument("action", choices=["build", "status", "query", "affected", "explain", "benchmark"])

@@ -66,7 +66,7 @@ def render_question(task_id: str, title: str, d: dict, others_running: int) -> s
         lines.append(f"  Work so far: {d['work_so_far'][:300]}")
     lines.append("")
     for i, opt in enumerate(d.get("options", []), 1):
-        lines.append(f"   {i}. {opt}")
+        lines.append(f"   {i}. {opt}{scope_note(d, i)}")
     if d.get("recommendation"):
         lines.append(f"  Agent recommends: {d['recommendation']}")
     lines += ["",
@@ -75,6 +75,12 @@ def render_question(task_id: str, title: str, d: dict, others_running: int) -> s
               + (f"  ({others_running} other agent(s) still working.)" if others_running else ""),
               bar]
     return "\n".join(lines)
+
+
+def scope_note(d: dict, option: int) -> str:
+    """' (adds to scope: a, b)' when picking this option widens the card's files_scope."""
+    paths = (d.get("scope_add") or {}).get(str(option))
+    return f" (adds to scope: {', '.join(paths)})" if paths else ""
 
 
 def parse_answer(text: str, d: dict) -> tuple[str, str | None]:
