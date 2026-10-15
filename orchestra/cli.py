@@ -388,9 +388,12 @@ def cmd_retry(args) -> None:
     fields = {"status": "pending", "attempts": 0}
     if args.model:
         fields["model"] = args.model
+    reset = t.triaged and not args.keep_triage  # a human re-queue earns a fresh triage
+    if reset:
+        fields["triaged"] = False
     store.update(args.task, **fields)
-    store.log(args.task, "retry", "re-queued by human")
-    print(f"{args.task} re-queued.")
+    store.log(args.task, "retry", "re-queued by human" + (" (triage reset)" if reset else ""))
+    print(f"{args.task} re-queued" + (" (it can be triaged again)." if reset else "."))
 
 
 def cmd_model(args) -> None:
@@ -712,6 +715,8 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("retry"); s.add_argument("task"); s.add_argument("--note")
     s.add_argument("--model", help="run this card on a specific model, e.g. opus")
     s.add_argument("--force", action="store_true", help="re-queue even a merged or running card")
+    s.add_argument("--keep-triage", action="store_true",
+                   help="don't reset the card's one triage (by default a retry earns a fresh one)")
     s.set_defaults(fn=cmd_retry)
     s = sub.add_parser("test-first", help="have locked acceptance tests written before the worker starts")
     s.add_argument("task"); s.add_argument("--off", action="store_true", help="turn it off")

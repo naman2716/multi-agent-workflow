@@ -19,7 +19,8 @@ from orchestra.harness import build_files, install_harness, stale_files  # noqa:
 from orchestra.orchestrator import Orchestrator  # noqa: E402
 from orchestra.store import Store  # noqa: E402
 from tests.test_decisions_limits import with_session  # noqa: E402
-from tests.test_orchestra import Base, FakeRunner, done  # noqa: E402
+from tests.test_orchestra import Base, FakeRunner, blocked, done  # noqa: E402
+from tests.test_run_without_you import TriageRunner  # noqa: E402
 
 
 def card(key, est=None, scope=None, deps=()):
@@ -214,6 +215,30 @@ class ScopeFromAnswers(Base):
         self.store.update("T17", status="merged")
         self.assertNotEqual(cli(self.repo, "scope", "T17", "--add", "x.py")[1], 0)
         self.assertEqual(cli(self.repo, "scope", "T17", "--add", "x.py", "--force")[1], 0)
+
+
+class RetryResetsTriage(Base):
+    def block_once(self):
+        runner = TriageRunner({"A": [blocked]})  # triage says: human
+        self.run_orch(runner)
+        return runner
+
+    def test_a_retried_card_is_triaged_again_on_its_next_block(self):
+        self.add("A", ["a.py"])
+        self.assertEqual(self.block_once().triage_calls, {"A": 1})
+        self.assertEqual((self.store.get("A").status, self.store.get("A").triaged), ("blocked", True))
+        out, code = cli(self.repo, "retry", "A")
+        self.assertEqual(code, 0, out)
+        self.assertIn("triaged again", out)
+        self.assertFalse(self.store.get("A").triaged)
+        self.assertEqual(self.block_once().triage_calls, {"A": 1})  # a fresh triage, not straight to you
+        self.assertTrue(any("triage reset" in (e["detail"] or "") for e in self.store.events("A")))
+
+    def test_keep_triage_keeps_the_old_behaviour(self):
+        self.add("A", ["a.py"])
+        self.block_once()
+        cli(self.repo, "retry", "A", "--keep-triage")
+        self.assertEqual(self.block_once().triage_calls, {})
 
 
 if __name__ == "__main__":

@@ -12,7 +12,8 @@ Task lifecycle:
                  +--> pending + resume_note (paused by a usage limit; resumes its session)
                  +--> blocked (attempts exhausted / agent says stuck; needs a human)
   Before blocking, a triage agent may rewrite the card (-> pending), move it to a stronger
-  model (-> pending), or split it (-> cancelled "split into ...", new cards pending). Once.
+  model (-> pending), or split it (-> cancelled "split into ...", new cards pending). Once,
+  until a human retries the card (`orchestra retry` resets it).
 """
 from __future__ import annotations
 

@@ -286,7 +286,9 @@ last work report and review, looks at the code at the integration head, and pick
 - **human**: it stays blocked, with the triage note on the card and in the notification.
 
 Each card is triaged at most once, never past the run budget, and you're notified of what it
-did (`orchestra status T03` shows it). `[autonomy].triage_actions` limits what is applied
+did (`orchestra status T03` shows it). `orchestra retry` gives the card a fresh triage (unless
+`--keep-triage`), so a triage spent on, say, a stale branch doesn't send its next real block
+straight to you. `[autonomy].triage_actions` limits what is applied
 automatically (others become a note for you); `triage = false` turns it off. If a usage limit
 stops a triage, it runs at the start of the next run.
 
