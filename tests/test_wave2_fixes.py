@@ -3,11 +3,13 @@ integration sync, test-writer reuse and size check, data-file hint, detached run
 resume, and the usage report."""
 import asyncio
 import io
+import os
 import json
 import sys
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -519,6 +521,110 @@ class DataFileHint(unittest.TestCase):
         self.assertIn("A data file copied into the repo is a sizing risk", rules)
         groom = build_files(Config(repo=Path("/tmp")), graph=False)[".claude/skills/groom/SKILL.md"]
         self.assertIn("A data file copied into the repo is a sizing risk", groom)
+
+
+class FakeShipper:
+    def __init__(self):
+        self.calls = 0
+
+    async def ship(self, wait_s=0):
+        from orchestra.ship import ShipResult
+        self.calls += 1
+        return ShipResult("shipped", pr_url="https://example/pr/2", pr_number=2, ci="passed")
+
+    async def changed_files(self):
+        return []
+
+
+class DetachedRuns(Base):
+    """bo9ktvxa6: killed during the CI wait when the Claude session restarted."""
+
+    def setUp(self):
+        super().setUp()
+        (self.repo / "orchestra.toml").write_text("[graph]\nenabled = false\n")
+
+    def test_detach_starts_a_new_session_with_a_log(self):
+        self.add("A", ["a.py"])
+        with mock.patch("orchestra.cli._popen") as popen:
+            popen.return_value.pid = 4242
+            out, code = cli(self.repo, "run", "--detach", "-j", "2", "--allow-diverged")
+        self.assertEqual(code, 0, out)
+        self.assertIn("pid 4242", out)
+        self.assertIn(".orchestra/run.log", out)
+        (cmd,), kw = popen.call_args
+        self.assertTrue(kw["start_new_session"])
+        self.assertEqual(Path(kw["stdout"].name).resolve(), (self.cfg.state_path / "run.log").resolve())
+        self.assertEqual(cmd[2:], ["orchestra.cli", "-C", str(self.repo.resolve()), "run", "--no-ask", "-j", "2",
+                                   "--allow-diverged"])
+        self.assertNotIn("--detach", cmd)
+        pkg_parent = str(Path(__file__).resolve().parents[1])
+        self.assertEqual(kw["env"]["PYTHONPATH"].split(os.pathsep)[0], pkg_parent)  # same code as the parent
+        self.assertIn("(detached)", (self.cfg.state_path / "run.log").read_text())
+
+    def test_detach_still_refuses_an_empty_queue(self):
+        with mock.patch("orchestra.cli._popen") as popen:
+            out, code = cli(self.repo, "run", "--detach")
+        self.assertNotEqual(code, 0)
+        self.assertIn("Nothing pending", out)
+        popen.assert_not_called()
+
+    def test_dispatch_skill_uses_detach(self):
+        dispatch = build_files(Config(repo=self.repo), graph=False)[".claude/skills/dispatch/SKILL.md"]
+        self.assertIn("orchestra run --detach -j <N>", dispatch)
+        self.assertIn(".orchestra/run.log", dispatch)
+        self.assertNotIn("run_in_background", dispatch)
+
+    def orch(self):
+        self.cfg.ship.auto = True
+        o = Orchestrator(self.cfg, self.store, FakeRunner({}), log=self.logs.append)
+        o.shipper = FakeShipper()
+        return o
+
+    def test_a_run_killed_while_shipping_ships_again_next_time(self):
+        self.add("A", ["a.py"])
+        self.store.update("A", status="merged")
+        self.store.set_meta("ship_pending", {"at": 1})  # what a kill during the CI wait leaves behind
+        o = self.orch()
+        asyncio.run(o.run())
+        self.assertEqual(o.shipper.calls, 1)
+        self.assertIsNone(self.store.get_meta("ship_pending"))
+        self.assertEqual(o.pr["ci"], "passed")
+        self.assertTrue(any("interrupted while shipping" in (e["detail"] or "") for e in self.store.events()))
+
+    def test_nothing_to_reship_means_no_ship(self):
+        self.add("A", ["a.py"])
+        self.store.update("A", status="merged")
+        o = self.orch()
+        asyncio.run(o.run())
+        self.assertEqual(o.shipper.calls, 0)
+
+    def test_cli_run_doesnt_stop_at_an_empty_queue_with_a_ship_pending(self):
+        (self.repo / "orchestra.toml").write_text("[graph]\nenabled = false\n[ship]\nauto = true\n")
+        self.add("A", ["a.py"])
+        self.store.update("A", status="merged")
+        self.store.set_meta("ship_pending", {"at": 1})
+        with mock.patch("orchestra.cli.Orchestrator") as orch:
+            orch.return_value.run = mock.AsyncMock(return_value={"blocked": 0})
+            orch.return_value.pr = None
+            out, code = cli(self.repo, "run")
+        self.assertNotIn("Nothing pending", out)
+        orch.return_value.run.assert_awaited_once()
+
+    def test_ship_sets_and_clears_the_marker(self):
+        self.add("A", ["a.py"])
+        o = self.orch()
+        seen = []
+        orig = o.shipper.ship
+
+        async def ship(wait_s=0):
+            seen.append(self.store.get_meta("ship_pending"))
+            return await orig(wait_s)
+        o.shipper.ship = ship
+        runner = FakeRunner({"A": [done(**{"a.py": "x = 1\n"})]})
+        o.runner = runner
+        asyncio.run(o.run())
+        self.assertTrue(seen and seen[0])
+        self.assertIsNone(self.store.get_meta("ship_pending"))
 
 
 if __name__ == "__main__":

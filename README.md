@@ -336,6 +336,15 @@ Needs the GitHub CLI logged in (`gh auth login`) on the machine that runs Orches
 remote or `gh` it says so and the run still succeeds. `orchestra ship` does the same by hand
 (`--no-wait` to skip CI).
 
+If a run is killed while shipping (say, during the CI wait), the next `orchestra run` ships again
+and waits for CI, even with nothing else to do.
+
+**Runs that outlive their session.** `orchestra run --detach` starts the run in its own process
+session, with output appended to `.orchestra/run.log`, and returns at once. Closing the terminal
+or restarting Claude Code doesn't stop it, and `/dispatch` starts runs this way. A detached run
+can't ask in the terminal, so answer with `orchestra decisions` / `orchestra answer`, `/decide`
+or your phone.
+
 ## Commit identity and push credentials
 
 Two separate things decide how agent work shows up on GitHub:

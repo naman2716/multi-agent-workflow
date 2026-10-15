@@ -322,6 +322,10 @@ class Orchestrator:
         if self.cfg.graph.enabled:
             await self.graph.refresh()
         merged_before = {t.id for t in self.store.all() if t.status == "merged"}
+        if self.cfg.ship.auto and self.store.get_meta("ship_pending"):
+            # the last run was stopped while shipping (e.g. killed during the CI wait): ship again
+            self.say(None, "the last run was interrupted while shipping; shipping again", "ship")
+            merged_before = set()
         for t in self.store.waiting():  # questions from before ntfy was set up (or not delivered)
             if not (t.decision or {}).get("pushed_at"):
                 self._push_question(t.id)
@@ -430,7 +434,9 @@ class Orchestrator:
                 return
             merged_before = merged_now  # ship again only after more work merges
             self.say(None, f"shipping: pushing {self.cfg.integration_branch} and updating the draft PR", "ship")
+            self.store.set_meta("ship_pending", {"at": time.time()})  # cleared once ship() returns
             res = await self.shipper.ship(wait_s=self.cfg.ship.ci_wait_minutes * 60)
+            self.store.set_meta("ship_pending", None)
             if res.status == "skipped":
                 self.say(None, f"not shipped: {res.note}", "ship")
                 return

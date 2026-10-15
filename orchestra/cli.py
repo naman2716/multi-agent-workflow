@@ -318,11 +318,14 @@ def cmd_run(args) -> None:
         sys.exit(3)
     # running/review cards with no live run were interrupted; the run will recover them
     phone = bool(cfg.ntfy.enabled and cfg.ntfy.reply_topic and cfg.ntfy.reply_topic != cfg.ntfy.topic)
+    reship = bool(cfg.ship.auto and store.get_meta("ship_pending"))  # a run died while shipping
     if not any(t.status in ("pending", "running", "review") for t in store.all()) \
-            and not (phone and store.waiting()):
+            and not (phone and store.waiting()) and not reship:
         waiting = store.waiting()
         sys.exit(f"Nothing pending; {len(waiting)} card(s) wait for your decision (orchestra decisions)."
                  if waiting else "Nothing pending. Use `orchestra plan` or `orchestra add` first.")
+    if args.detach:
+        return _detach_run(cfg, args)
     try:
         sys.stdout.reconfigure(line_buffering=True)  # live output when piped (e.g. /dispatch)
     except (AttributeError, ValueError):
@@ -349,6 +352,38 @@ def cmd_run(args) -> None:
         print(f"\nReview the result: git log {cfg.base_branch}..{cfg.integration_branch}, "
               f"then `orchestra ship` (or open a PR from {cfg.integration_branch}).")
     sys.exit(0 if counts["blocked"] == 0 else 2)
+
+
+def _popen(*args, **kw) -> subprocess.Popen:
+    return subprocess.Popen(*args, **kw)
+
+
+def _detach_run(cfg: Config, args) -> None:
+    """Start this run in its own process session, so it outlives the terminal or Claude Code
+    session that started it, with output appended to <state>/run.log."""
+    import os
+    log = cfg.state_path / "run.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [sys.executable, "-m", "orchestra.cli", "-C", str(cfg.repo), "run", "--no-ask"]
+    if args.concurrency:
+        cmd += ["-j", str(args.concurrency)]
+    if args.budget:
+        cmd += ["--budget", str(args.budget)]
+    cmd += [flag for flag, on in (("-v", args.verbose), ("--no-wait", args.no_wait),
+                                  ("--allow-diverged", args.allow_diverged)) if on]
+    # the same Orchestra code as this process, whatever the child's working directory
+    pkg_parent = str(Path(__file__).resolve().parents[1])
+    env = {**os.environ, "PYTHONUNBUFFERED": "1",
+           "PYTHONPATH": os.pathsep.join([pkg_parent, *filter(None, [os.environ.get("PYTHONPATH")])])}
+    with open(log, "a") as out:
+        out.write(f"\n--- orchestra run started {time.strftime('%Y-%m-%d %H:%M:%S')} (detached) ---\n")
+        out.flush()
+        proc = _popen(cmd, cwd=cfg.repo, stdin=subprocess.DEVNULL, stdout=out,
+                      stderr=subprocess.STDOUT, start_new_session=True, env=env)
+    rel = log.relative_to(cfg.repo) if log.is_relative_to(cfg.repo) else log
+    print(f"Run started in the background (pid {proc.pid}); output goes to {rel}.\n"
+          f"It keeps going if this terminal or session ends. Follow it with `tail -f {rel}` "
+          "or `orchestra status`; answer questions with `orchestra decisions` / `orchestra answer`.")
 
 
 def cmd_status(args) -> None:
@@ -786,6 +821,8 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_add)
     s = sub.add_parser("run"); s.add_argument("-j", "--concurrency", type=int)
     s.add_argument("--budget", type=float); s.add_argument("-v", "--verbose", action="store_true")
+    s.add_argument("--detach", action="store_true",
+                   help="run in the background, in its own session (survives this terminal); log in <state>/run.log")
     s.add_argument("--allow-diverged", action="store_true", help="proceed although the integration branch has diverged from base")
     s.add_argument("--no-ask", action="store_true",
                    help="don't ask questions in this terminal (answer later with orchestra answer)")

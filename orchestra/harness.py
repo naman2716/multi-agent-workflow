@@ -76,6 +76,7 @@ def build_files(cfg: Config, graph: bool) -> dict[str, str]:
                "mcp__graph__shortest_path"] if graph else []
     guide = GRAPH_GUIDE if graph else ""
     integ, base = cfg.integration_branch, cfg.base_branch
+    log = f"{cfg.state_dir.rstrip('/')}/run.log"
     files: dict[str, str] = {}
 
     files[".claude/agents/orchestra-planner.md"] = _agent(
@@ -153,10 +154,12 @@ any agent writes code. Tight cards are the most important quality gate in the sy
 1. Run `orchestra status`. If nothing is pending, say so and suggest `/groom`.
 2. Confirm concurrency and budget with the user if they haven't said (defaults come from
    orchestra.toml). Rate limits are shared with this session, so 2–4 workers is typical.
-3. Start the run in the background: `orchestra run -j <N>` (use run_in_background), so this
-   session stays free for the user. Each card gets its own worktree, automated gates, an
-   independent reviewer, and is merged into `{integ}`, never into `{base}`.
-4. Keep an eye on the run's output while it works. When a line says
+3. Start the run detached: `orchestra run --detach -j <N>`. It runs in its own process
+   session, so it keeps going if this Claude Code session ends or restarts, and its output
+   goes to `{log}`. Each card gets its own worktree, automated gates, an independent
+   reviewer, and is merged into `{integ}`, never into `{base}`.
+4. Keep an eye on the run while it works: read the end of `{log}` (`tail -n 40 {log}`) and
+   `orchestra status` every few minutes. When a line says
    `needs your decision`, bring it to the user right away; don't wait for the run to end:
    run `orchestra decisions`, then ask with AskUserQuestion using the agent's options (mark
    the recommended one; the user can also type their own answer). Record it exactly with
@@ -175,6 +178,10 @@ any agent writes code. Tight cards are the most important quality gate in the sy
    Red CI became a fix card automatically (up to `[ship].ci_fix_rounds` times); say whether
    it went green.
 8. Suggest `/review-integration` to review what landed.
+
+If this session restarts, the run is still going: check `orchestra status` and the log. A run
+that was killed anyway can simply be started again; it resumes interrupted cards, and if it was
+killed while shipping, it ships again and waits for CI.
 
 Tip for the user: running `orchestra run` in their own terminal instead shows questions
 right there as they come up, with numbered options to answer inline.
