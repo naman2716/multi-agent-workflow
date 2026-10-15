@@ -504,5 +504,22 @@ class TestWriterReuse(Base):
         self.assertTrue(r.prompt.rstrip().endswith("Write the acceptance tests for this card now (tests only)."))
 
 
+class DataFileHint(unittest.TestCase):
+    """#139: T17 copied a ~1,500-line JSON file; triage proposed a compact form + round-trip test."""
+
+    def test_workers_test_writers_and_triage_get_the_hint(self):
+        from orchestra.agents import DATA_FILE_HINT, TEST_WRITER_APPEND, TRIAGE_SYSTEM, sizing_rules
+        for prompt in (WORKER_APPEND, TEST_WRITER_APPEND, TRIAGE_SYSTEM):
+            self.assertIn(DATA_FILE_HINT, prompt)
+        self.assertIn("round-trips", DATA_FILE_HINT)
+        self.assertIn("diff_exclude", DATA_FILE_HINT)
+        for prompt in (WORKER_APPEND, TEST_WRITER_APPEND):
+            self.assertTrue(prompt.rstrip().endswith("Your final answer must be the structured report."))
+        rules = sizing_rules(Config(repo=Path("/tmp")))
+        self.assertIn("A data file copied into the repo is a sizing risk", rules)
+        groom = build_files(Config(repo=Path("/tmp")), graph=False)[".claude/skills/groom/SKILL.md"]
+        self.assertIn("A data file copied into the repo is a sizing risk", groom)
+
+
 if __name__ == "__main__":
     unittest.main()

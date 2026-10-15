@@ -224,6 +224,12 @@ Check it against the goal and the actual repository (read-only):
 Return verdict "ok" with the plan unchanged if it is sound; otherwise "revise", list each
 problem with its fix, and return the full corrected plan (same keys where cards are unchanged)."""
 
+DATA_FILE_HINT = """
+- If a data file (JSON, CSV, fixtures, snapshots, seed data) would dominate the diff, don't commit
+  it as is: commit a compact form (one record per line) with a test that it round-trips to the
+  source, or build it at test time; if it is truly generated, say so and suggest a diff_exclude
+  entry for its folder."""
+
 TRIAGE_SYSTEM = """You triage a task card in a multi-agent coding system that is about to be
 marked blocked: its attempts are used up, or its worker reported it can't proceed. Read the card,
 its history and the repository (read-only), find the real cause, and choose ONE action:
@@ -241,7 +247,9 @@ For a test-first card, changing the spec or acceptance criteria also discards it
 acceptance tests so they are written again; if a locked test itself is wrong, fix the criterion
 it came from or set regenerate_tests.
 Prefer the smallest change that would make the next attempt succeed. If no automatic action is
-clearly right, choose human. Always write note_for_human."""
+clearly right, choose human. Always write note_for_human.
+When copied or generated data makes a card too big, say how to shrink it in the rewrite or split:""" \
+    + DATA_FILE_HINT
 
 WORKER_APPEND = """
 You are a worker agent in a multi-agent orchestrator. You own exactly ONE task card.
@@ -264,7 +272,7 @@ You are a worker agent in a multi-agent orchestrator. You own exactly ONE task c
 - Diffs over the project's size limit are rejected. If a size check says you passed it, stop and
   report "blocked" with how to split the card; don't trim the work to fit.
 - Before reporting "done", run the checks listed on the card and fix what fails; the
-  orchestrator runs exactly those commands next.
+  orchestrator runs exactly those commands next.""" + DATA_FILE_HINT + """
 Your final answer must be the structured report."""
 
 SANDBOX_NOTE = """
@@ -307,7 +315,7 @@ You write the acceptance tests for ONE task card BEFORE anyone implements it.
 - Run them to confirm they fail for the right reason (missing behaviour, not syntax errors).
 - If a criterion is ambiguous, test the clearest reading and list it under assumptions; do not
   ask questions. Report "blocked" only if the card can't be tested at all.
-- These files will be locked: the implementer can't edit them.
+- These files will be locked: the implementer can't edit them.""" + DATA_FILE_HINT + """
 Your final answer must be the structured report."""
 
 
@@ -372,6 +380,8 @@ size is thrown away and split, so size cards before work starts:
 - Split any card estimated above {split_at} lines into cards ordered with depends_on.
 - Generated or example data (JSON payloads, fixtures, snapshots, seed data) counts in full. Keep
   committed examples small and hand-trimmed, and build full data at test time instead.
+- A data file copied into the repo is a sizing risk: plan a compact form (one record per line)
+  with a round-trip test, or build it at test time; generated folders belong in diff_exclude.
 - Say in size_notes what dominates the size."""
 
 

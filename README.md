@@ -490,6 +490,11 @@ it stops and reports blocked instead of writing it all. A diff over `oversize_tr
   first; set `setup_cmd` (e.g. `npm ci`) so each worktree can run them. The worker's card lists
   every gate command so it runs them before reporting done. Mark cheap gates `fast = true`.
 - **Lockfiles don't count** toward `max_diff_lines` (`[quality].diff_exclude`).
+- **Data files do count.** A JSON, CSV or seed file copied into the repo counts line by line
+  (T17 in the PCME run copied ~1,500 lines of JSON and failed the gate). Put folders of truly
+  generated data in `[quality].diff_exclude`. Otherwise keep committed examples hand-trimmed, or
+  commit a compact form (one record per line) with a test that it round-trips to the source.
+  Workers, test writers and triage are told the same.
 - **`gates_on_stop` (opt-in).** A Stop hook runs the `fast` gates when the worker reports done
   and sends it back once with the failures. Enable it after the smoke test below shows it works
   with your SDK version.
