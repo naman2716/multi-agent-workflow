@@ -34,3 +34,7 @@ For a card with locked acceptance tests, every gate run SHALL use the locked ver
 Diff statistics SHALL list both the old and the new path of a renamed or copied file (never git's
 `old => new` display form), so the scope gate checks each location; a card that moves files needs
 both locations in its `files_scope`.
+
+### Requirement: The worker's running size matches the gate
+The in-session size check SHALL count tracked edits and new files against the card's base,
+excluding `diff_exclude` and locked tests, without touching the worktree's index.
