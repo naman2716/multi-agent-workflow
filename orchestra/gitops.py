@@ -201,6 +201,46 @@ def matches_any(path: str, patterns) -> bool:
     return any(fnmatch.fnmatch(path, p) or fnmatch.fnmatch(name, p) for p in patterns)
 
 
+class SyncError(RuntimeError):
+    """The integration branch and the base branch have diverged; a human decides what to do."""
+
+
+@dataclass
+class SyncResult:
+    """How the integration branch stood against the base branch, and what sync did about it.
+    action: created | up_to_date | ahead | fast_forwarded | behind | diverged | no_base"""
+    action: str
+    old: str = ""
+    new: str = ""
+    only_integration: int = 0
+    only_base: int = 0
+    contained: bool = False  # diverged, but base already has everything integration has
+    note: str = ""
+
+    def message(self, base: str, integration: str) -> str:
+        short = lambda s: s[:7]  # noqa: E731
+        if self.action == "created":
+            return f"created {integration} from {base}"
+        if self.action == "fast_forwarded":
+            return f"{integration} fast-forwarded {short(self.old)} → {short(self.new)} ({base} moved)"
+        if self.action == "behind":
+            return (f"{integration} is behind {base} ({self.only_base} commit(s)); "
+                    + (self.note or "it will be fast-forwarded when nothing else is using it"))
+        if self.action == "diverged":
+            msg = (f"{integration} and {base} have diverged ({self.only_integration} commit(s) only on "
+                   f"{integration}, {self.only_base} only on {base}). ")
+            if self.contained:
+                msg += (f"{base} already contains every change on {integration}, so its PR was probably "
+                        f"squash-merged: with no cards open, reset it with "
+                        f"`git branch -f {integration} {base}`. ")
+            else:
+                msg += f"Merge {base} into {integration} (or reset it if its PR was squash-merged). "
+            return msg + "Then retry, or pass --allow-diverged to work on it as it is."
+        if self.action == "no_base":
+            return f"base branch {base} not found; {integration} left as it is"
+        return ""
+
+
 class Git:
     def __init__(self, repo: Path, worktree_root: Path, base: str, integration: str, settings=None):
         """`settings` is the [git] section (author, co_author, run_hooks); defaults when None."""
@@ -241,6 +281,61 @@ class Git:
                           self.repo, check=False)
         if rc != 0:
             await git(self.repo, "branch", self.integration, self.base)
+
+    async def sync_integration(self, allow_diverged: bool = False, move: bool = True,
+                               create: bool = True) -> SyncResult:
+        """Bring the integration branch up to the base branch (local refs only, no fetch).
+        Missing: created from base (with `create`). Behind: fast-forwarded with a compare-and-swap
+        (with `move`, and only if no checkout has it). Ahead or equal: left alone. Diverged:
+        SyncError unless `allow_diverged`."""
+        integ_ref, base_ref = f"refs/heads/{self.integration}", f"refs/heads/{self.base}"
+        rc, _ = await run(["git", "rev-parse", "--verify", "-q", integ_ref], self.repo, check=False)
+        if rc != 0:
+            if not create:
+                return SyncResult("up_to_date")
+            await git(self.repo, "branch", self.integration, self.base)
+            return SyncResult("created")
+        rc, base_sha = await run(["git", "rev-parse", "--verify", "-q", base_ref], self.repo, check=False)
+        if rc != 0:
+            return SyncResult("no_base")
+        base_sha = base_sha.strip()
+        integ_sha = await git(self.repo, "rev-parse", integ_ref)
+        if base_sha == integ_sha:
+            return SyncResult("up_to_date", integ_sha, integ_sha)
+
+        async def ancestor(a: str, b: str) -> bool:
+            return (await run(["git", "merge-base", "--is-ancestor", a, b], self.repo, check=False))[0] == 0
+        if await ancestor(base_sha, integ_sha):
+            return SyncResult("ahead", integ_sha, integ_sha)
+        counts = (await git(self.repo, "rev-list", "--left-right", "--count",
+                            f"{integ_sha}...{base_sha}")).split()
+        only_i, only_b = int(counts[0]), int(counts[1])
+        if await ancestor(integ_sha, base_sha):
+            holder = await self._checked_out_at(integ_ref)
+            if not move or holder:
+                return SyncResult("behind", integ_sha, integ_sha, only_base=only_b,
+                                  note=f"it is checked out in {holder}; fast-forward it there" if holder else "")
+            await git(self.repo, "update-ref", integ_ref, base_sha, integ_sha)  # CAS
+            return SyncResult("fast_forwarded", integ_sha, base_sha, only_base=only_b)
+        # diverged: does base already hold integration's content (a squash-merged PR)?
+        rc, tree = await run(["git", "merge-tree", "--write-tree", base_sha, integ_sha], self.repo, check=False)
+        base_tree = await git(self.repo, "rev-parse", f"{base_sha}^{{tree}}")
+        res = SyncResult("diverged", integ_sha, integ_sha, only_i, only_b,
+                         contained=rc == 0 and tree.split()[:1] == [base_tree])
+        if not allow_diverged:
+            raise SyncError(res.message(self.base, self.integration))
+        return res
+
+    async def _checked_out_at(self, ref: str) -> str:
+        """The worktree that has `ref` checked out, or ''."""
+        out = await git(self.repo, "worktree", "list", "--porcelain")
+        path = ""
+        for line in out.splitlines():
+            if line.startswith("worktree "):
+                path = line[len("worktree "):]
+            elif line == f"branch {ref}":
+                return path
+        return ""
 
     async def head(self, ref: str) -> str:
         return await git(self.repo, "rev-parse", ref)

@@ -31,6 +31,8 @@
       the single validator, the oversize-to-triage path, the reviewer note order.
 
 ## Phase 2: measure and close
-- [ ] 3.1 Next comparable wave → `after.md` with `orchestra usage`; compare cost per merged card,
-      cancelled-card spend, cold-start writes, peak context, first-round review pass rate
-- [ ] 3.2 Merge deltas into `openspec/specs/`, archive the change
+- [x] 3.1 `after.md` from the PCME waves 1.5 + 2 export (2026-10-16): cost per merged card
+      $2.11 → $1.74; cancelled/blocked spend $6.08 (26%) → $4.22 (24%); cold-start writes per
+      session unchanged (16k), 0 one-hour writes; agent peak context 145k → 133k; first-round
+      review pass rate 82% → 90%. What's left went to `wave-2-fixes`
+- [x] 3.2 Deltas merged into `openspec/specs/`; archived 2026-10-16

@@ -93,6 +93,7 @@ class EnvSettings:
 @dataclass
 class Planning:
     critic: bool = True          # a critic agent reviews every plan and returns a corrected one
+    require_estimates: bool = False  # approve/add refuse cards without estimated_lines
 
 
 CACHE_TTLS = {"5m": {"FORCE_PROMPT_CACHING_5M": "1"}, "1h": {"ENABLE_PROMPT_CACHING_1H": "1"}, "auto": {}}
@@ -204,6 +205,7 @@ class Config:
     max_diff_lines: int = 600
     split_above: float = 0.7  # planner/critic split cards estimated above this share of max_diff_lines
     oversize_triage_factor: float = 1.5  # a diff this many times the limit goes to triage, not a trim round
+    test_max_lines: int = 0  # size budget for a test writer's locked tests (0 = max_diff_lines)
     diff_exclude: list[str] = field(default_factory=lambda: list(DEFAULT_DIFF_EXCLUDE))
     enforce_file_scope: bool = True
     setup_cmd: str = ""  # run once in each new worktree, e.g. "npm ci"
@@ -284,6 +286,7 @@ class Config:
             max_diff_lines=q.get("max_diff_lines", 600),
             split_above=q.get("split_above", 0.7),
             oversize_triage_factor=q.get("oversize_triage_factor", 1.5),
+            test_max_lines=q.get("test_max_lines", 0),
             diff_exclude=q.get("diff_exclude", list(DEFAULT_DIFF_EXCLUDE)),
             enforce_file_scope=q.get("enforce_file_scope", True),
             setup_cmd=q.get("setup_cmd", ""),
@@ -449,6 +452,7 @@ comment = false                 # comment on the ticket when cards are queued an
 max_diff_lines = 600       # reject oversized diffs (comprehension debt)
 split_above = 0.7          # plans split cards estimated above this share of max_diff_lines
 oversize_triage_factor = 1.5  # a diff this many times max_diff_lines goes straight to triage (split)
+test_max_lines = 0         # size budget for test writers' locked tests (0 = max_diff_lines)
 # files whose changed lines don't count toward max_diff_lines (lockfiles, generated code)
 diff_exclude = ["*.lock", "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "pubspec.lock", "go.sum", "poetry.lock", "uv.lock", "Cargo.lock"]
 enforce_file_scope = true  # reject edits outside a task's declared files
@@ -481,10 +485,11 @@ port_span = 100
 
 [planning]
 critic = true              # a critic agent checks each plan and returns a corrected one
+require_estimates = false  # true: approve/add refuse cards without estimated_lines (else a warning)
 
 [agents]
 cache_ttl = "5m"           # prompt-cache lifetime for agent sessions: "5m" (cheaper writes), "1h" or "auto"
-bash_output_max_chars = 8000  # longer Bash output reaches workers as head + tail (0 = off)
+bash_output_max_chars = 8000  # long Bash output reaches every agent as head + tail (0 = off)
 
 [sandbox]
 # Worker shell commands run in Claude Code's OS sandbox (Seatbelt on macOS): writes only in

@@ -214,7 +214,7 @@ class OversizeStopsEarly(Base):
         self.assertIn("Write", matcher.matcher)
         self.assertIn("Bash", matcher.matcher)
         asyncio.run(r.write_tests(self.cfg, task, self.repo))
-        self.assertNotIn("PostToolUse", r.options.hooks)          # test writers aren't size-checked
+        self.assertIn("PostToolUse", r.options.hooks)  # test writers have their own budget (wave-2-fixes 6)
 
     def run_oversized(self, n_lines):
         self.cfg.max_diff_lines = 100
@@ -470,7 +470,7 @@ class BashOutputCap(unittest.TestCase):
             asyncio.run(r.work(cfg, task, Path(d)))
             self.assertEqual([m.matcher for m in r.options.hooks["PreToolUse"]], [None, "Bash"])
             asyncio.run(r.review(cfg, task, Path(d), "diff", {}, "log"))
-            self.assertEqual(len(r.options.hooks["PreToolUse"]), 1)       # reviewers unchanged
+            self.assertEqual([m.matcher for m in r.options.hooks["PreToolUse"]], [None, "Bash"])  # reviewers too (wave-2 9b)
             cfg.agents.bash_output_max_chars = 0
             asyncio.run(r.work(cfg, task, Path(d)))
             self.assertEqual(len(r.options.hooks["PreToolUse"]), 1)

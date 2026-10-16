@@ -33,16 +33,17 @@ from pathlib import Path
 from typing import Callable
 
 from .agents import (GATE_FIX_PREFIX, Runner, blocking_findings, check_verdict, drop_refuted,
-                     model_family, pick_reviewer_model, pick_worker_model, task_card)
+                     model_family, parent_tests_note, pick_reviewer_model, pick_worker_model, task_card)
 from .config import Config
-from .gates import GateResult, in_scope, run_gates, summarize_failures
+from .gates import GateResult, run_gates, summarize_failures
 from .asking import LineSource, parse_answer, render_question
+from .cards import MAX_SCOPE_ADD, CardError, clean_scope_paths, serialize_against_open, split_card
 from .gitops import Git, HookRejected, clone_into, matches_any, run
 from .graph import Graph, GraphData
 from .limits import UsageLimits, notify
 from .linear import Linear
 from .ntfy import REPLY_HELP, Ntfy, parse_reply, question_tag
-from .planning import PlanError, _scopes_overlap, build_tasks
+from .planning import build_tasks
 from .ship import Shipper, ShipResult
 from .store import OPEN_STATUSES, Store, Task
 
@@ -103,6 +104,7 @@ class Orchestrator:
         self.git = Git(cfg.repo, cfg.worktree_root, cfg.base_branch, cfg.integration_branch, cfg.git)
         self.handoff_dir = cfg.state_path / "handoffs"
         self.stop_reason = ""
+        self.allow_diverged = False  # run on an integration branch that has diverged from base
         self.graph = Graph(cfg.repo, cfg.worktree_root, cfg.integration_branch, cfg.state_path,
                            cfg.graph, log=lambda m: self.say(None, m))
         self.limits = UsageLimits(cfg.limits, log=lambda m: self.say(None, m, "limit"))
@@ -313,11 +315,17 @@ class Orchestrator:
     async def _run(self) -> dict[str, int]:
         self._start_cost = self.store.total_cost()
         started = self._run_started = time.time()
-        await self.git.ensure_integration_branch()
+        sync = await self.git.sync_integration(allow_diverged=self.allow_diverged)  # SyncError: stop
+        if msg := sync.message(self.cfg.base_branch, self.cfg.integration_branch):
+            self.say(None, msg, "sync")
         await self._recover()
         if self.cfg.graph.enabled:
             await self.graph.refresh()
         merged_before = {t.id for t in self.store.all() if t.status == "merged"}
+        if self.cfg.ship.auto and self.store.get_meta("ship_pending"):
+            # the last run was stopped while shipping (e.g. killed during the CI wait): ship again
+            self.say(None, "the last run was interrupted while shipping; shipping again", "ship")
+            merged_before = set()
         for t in self.store.waiting():  # questions from before ntfy was set up (or not delivered)
             if not (t.decision or {}).get("pushed_at"):
                 self._push_question(t.id)
@@ -426,7 +434,9 @@ class Orchestrator:
                 return
             merged_before = merged_now  # ship again only after more work merges
             self.say(None, f"shipping: pushing {self.cfg.integration_branch} and updating the draft PR", "ship")
+            self.store.set_meta("ship_pending", {"at": time.time()})  # cleared once ship() returns
             res = await self.shipper.ship(wait_s=self.cfg.ship.ci_wait_minutes * 60)
+            self.store.set_meta("ship_pending", None)
             if res.status == "skipped":
                 self.say(None, f"not shipped: {res.note}", "ship")
                 return
@@ -659,7 +669,9 @@ class Orchestrator:
             self.say(task.id, "saved acceptance tests no longer apply; writing them again", "tests")
 
         started = time.time()
-        res = await self.runner.write_tests(cfg, replace(task, session_id=None), wt, graph=graph, env=env)
+        reference = self._parent_tests(task)
+        res = await self.runner.write_tests(cfg, replace(task, session_id=None, base_commit=base), wt,
+                                            graph=graph, env=env, **({"reference": reference} if reference else {}))
         self._spent(task, res, "test_writer", started)
         if not res.ok:
             if res.limited:
@@ -865,6 +877,14 @@ class Orchestrator:
         self.say(task.id, f"validated {len(checked)} blocking finding(s): {len(refuted)} refuted", "validate")
         return drop_refuted(verdict, refuted)
 
+    def _parent_tests(self, task: Task) -> str:
+        """A split child of a test-first card: the tests written for its parent, as a start."""
+        parent = self.store.get_meta(f"tests_from:{task.id}")
+        patch = self.handoff_dir / f"{parent}.tests.patch" if parent else None
+        if not (patch and patch.is_file()):
+            return ""
+        return parent_tests_note(parent, patch.read_text(errors="replace"))
+
     def _tests_note(self, task: Task) -> str:
         try:
             info = json.loads((self.handoff_dir / f"{task.id}.tests.json").read_text())
@@ -977,6 +997,21 @@ class Orchestrator:
                     "options": d.get("options", []), "recommendation": d.get("recommendation", ""),
                     "why_it_matters": d.get("why_it_matters", ""), "asked_at": time.time(),
                     "work_so_far": report.get("summary", "")}
+        scope_add, dropped = {}, []
+        for item in d.get("scope_add") or []:
+            try:
+                n = int(item.get("option"))
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if 1 <= n <= len(decision["options"]):
+                ok, bad = clean_scope_paths(item.get("paths") or [], self.cfg.state_dir)
+                dropped += bad + ok[MAX_SCOPE_ADD:]
+                if ok:
+                    scope_add[str(n)] = ok[:MAX_SCOPE_ADD]
+        if scope_add:
+            decision["scope_add"] = scope_add
+        if dropped:
+            self.say(task.id, f"dropped scope paths the question can't grant: {', '.join(dropped)[:200]}", "warn")
         self.store.update(task.id, status="waiting", decision=decision)
         self.say(task.id, f"needs your decision: {decision['question'][:200]}", "decision")
         notify(self.cfg.notify_cmd, f"Orchestra: {task.id} needs a decision", decision["question"][:200])
@@ -1110,18 +1145,6 @@ class Orchestrator:
         parts.append(f"## Allowed actions\n{', '.join(allowed + ['human'])}")
         return "\n\n".join(parts)
 
-    def _dependents(self, task_id: str, tasks: dict[str, Task]) -> set[str]:
-        """Cards that depend on `task_id`, directly or through other cards."""
-        out: set[str] = set()
-        frontier = [task_id]
-        while frontier:
-            cur = frontier.pop()
-            for t in tasks.values():
-                if cur in t.depends_on and t.id not in out:
-                    out.add(t.id)
-                    frontier.append(t.id)
-        return out
-
     def _requeue_fields(self) -> dict:
         return {"status": "pending", "attempts": 0, "worktree": None, "session_id": None, "resume_note": None}
 
@@ -1148,20 +1171,8 @@ class Orchestrator:
         self.store.update(task.id, **update)
         changed = sorted(fields) + (["acceptance tests rewritten"] if regenerate and not fields else [])
         self.store.add_feedback(task.id, f"Triage rewrote this card ({', '.join(changed)}): {why}")
-        added = self._serialize_against_open(task.id, fields["files_scope"]) if "files_scope" in fields else []
+        added = serialize_against_open(self.store, task.id, fields["files_scope"]) if "files_scope" in fields else []
         return f"rewritten ({', '.join(changed)})" + (f"; now waits for {', '.join(added)}" if added else "")
-
-    def _serialize_against_open(self, task_id: str, scope: list[str]) -> list[str]:
-        """After a scope change: wait for open cards that touch the same files (never for a
-        card that waits on this one, so no cycle)."""
-        tasks = {t.id: t for t in self.store.all()}
-        me, dependents = tasks[task_id], self._dependents(task_id, tasks)
-        added = [t.id for t in tasks.values()
-                 if t.id != task_id and t.status in OPEN_STATUSES and t.id not in dependents
-                 and t.id not in me.depends_on and _scopes_overlap(t.files_scope, scope)]
-        if added:
-            self.store.update(task_id, depends_on=me.depends_on + added)
-        return added
 
     def _triage_escalate(self, task: Task, data: dict, why: str) -> str:
         target = (data.get("model") or "").strip() or "opus"
@@ -1174,38 +1185,14 @@ class Orchestrator:
         return f"retrying on {target}"
 
     def _triage_split(self, task: Task, data: dict, why: str) -> str:
-        items = data.get("cards") or []
-        if not isinstance(items, list) or len(items) < 2:
-            raise TriageRejected("a split needs at least two cards")
-        tasks = {t.id: t for t in self.store.all()}
-        dependents = self._dependents(task.id, tasks)
-        existing = [t for t in self.store.open_tasks() if t.id != task.id and t.id not in dependents]
         try:
-            new, notes = build_tasks({"tasks": items}, start=len(tasks) + 1, existing=existing,
-                                     split_at=int(self.cfg.max_diff_lines * self.cfg.split_above))
-        except (PlanError, KeyError, TypeError, AttributeError) as e:
-            raise TriageRejected(f"its split was invalid ({e})") from None
-        if task.files_scope:
-            outside = [f"{n.title}: {p}" for n in new for p in (n.files_scope or ["(unrestricted)"])
-                       if not in_scope(p, task.files_scope)]
-            if outside:
-                raise TriageRejected("the split reaches outside the card's files_scope ("
-                                     + "; ".join(outside[:3]) + ")")
-        ids = [n.id for n in new]
+            ids, notes = split_card(self.store, task, data.get("cards") or [], why,
+                                    split_at=int(self.cfg.max_diff_lines * self.cfg.split_above))
+        except CardError as e:
+            raise TriageRejected(str(e)) from None
         for note in notes:
             if "split threshold" in note:
                 self.say(task.id, f"triage split: {note}", "warn")
-        for n in new:
-            n.depends_on = list(dict.fromkeys(n.depends_on + task.depends_on))
-            n.test_first, n.source, n.triaged = task.test_first, task.source, True
-            n.model = n.model or task.model
-            self.store.add_task(n)
-            self.store.add_feedback(n.id, f"Split from {task.id} by triage: {why}")
-        for t in tasks.values():
-            if task.id in t.depends_on:
-                self.store.update(t.id, depends_on=[d for d in t.depends_on if d != task.id] + ids)
-        self.store.update(task.id, status="cancelled", summary=f"split into {', '.join(ids)}",
-                          worktree=None, session_id=None, resume_note=None)
         return f"split into {', '.join(ids)}"
 
     async def _pause_for_limit(self, task: Task, res, stage: str | None = None) -> None:

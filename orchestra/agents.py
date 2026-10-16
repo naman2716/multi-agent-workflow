@@ -14,6 +14,7 @@ orchestrator treats each output as a *candidate* to check, never as prose to tru
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,6 +74,14 @@ WORK_SCHEMA = {
                 "options": {"type": "array", "items": {"type": "string"}},
                 "recommendation": {"type": "string"},
                 "why_it_matters": {"type": "string"},
+                "scope_add": {
+                    "type": "array",
+                    "description": "files outside files_scope that an option needs, per option",
+                    "items": {"type": "object", "properties": {
+                        "option": {"type": "integer", "description": "1-based option number"},
+                        "paths": {"type": "array", "items": {"type": "string"}}},
+                        "required": ["option", "paths"]},
+                },
             },
             "required": ["question", "options", "recommendation", "why_it_matters"],
         },
@@ -215,6 +224,12 @@ Check it against the goal and the actual repository (read-only):
 Return verdict "ok" with the plan unchanged if it is sound; otherwise "revise", list each
 problem with its fix, and return the full corrected plan (same keys where cards are unchanged)."""
 
+DATA_FILE_HINT = """
+- If a data file (JSON, CSV, fixtures, snapshots, seed data) would dominate the diff, don't commit
+  it as is: commit a compact form (one record per line) with a test that it round-trips to the
+  source, or build it at test time; if it is truly generated, say so and suggest a diff_exclude
+  entry for its folder."""
+
 TRIAGE_SYSTEM = """You triage a task card in a multi-agent coding system that is about to be
 marked blocked: its attempts are used up, or its worker reported it can't proceed. Read the card,
 its history and the repository (read-only), find the real cause, and choose ONE action:
@@ -232,7 +247,9 @@ For a test-first card, changing the spec or acceptance criteria also discards it
 acceptance tests so they are written again; if a locked test itself is wrong, fix the criterion
 it came from or set regenerate_tests.
 Prefer the smallest change that would make the next attempt succeed. If no automatic action is
-clearly right, choose human. Always write note_for_human."""
+clearly right, choose human. Always write note_for_human.
+When copied or generated data makes a card too big, say how to shrink it in the rewrite or split:""" \
+    + DATA_FILE_HINT
 
 WORKER_APPEND = """
 You are a worker agent in a multi-agent orchestrator. You own exactly ONE task card.
@@ -246,15 +263,16 @@ You are a worker agent in a multi-agent orchestrator. You own exactly ONE task c
   depend on (a business rule, pricing, data migration, a public API shape, deleting data),
   do NOT guess: stop early and report status "needs_decision" with one clear question,
   2-4 concrete options, your recommendation, and why it matters. Keep any work done so far;
-  you will resume this same session with the answer. For minor choices (naming, internal
-  structure), decide yourself and mention it in the summary.
+  you will resume this same session with the answer. If an option needs files outside your
+  files_scope, list them under scope_add for that option, so picking it lets you edit them.
+  For minor choices (naming, internal structure), decide yourself and mention it in the summary.
 - If the task is impossible as written (missing access, contradictory requirements),
   report status "blocked" with a precise blocker.
 - Prefer fast, targeted test runs over full suites; don't loop on slow commands.
 - Diffs over the project's size limit are rejected. If a size check says you passed it, stop and
   report "blocked" with how to split the card; don't trim the work to fit.
 - Before reporting "done", run the checks listed on the card and fix what fails; the
-  orchestrator runs exactly those commands next.
+  orchestrator runs exactly those commands next.""" + DATA_FILE_HINT + """
 Your final answer must be the structured report."""
 
 SANDBOX_NOTE = """
@@ -297,8 +315,54 @@ You write the acceptance tests for ONE task card BEFORE anyone implements it.
 - Run them to confirm they fail for the right reason (missing behaviour, not syntax errors).
 - If a criterion is ambiguous, test the clearest reading and list it under assumptions; do not
   ask questions. Report "blocked" only if the card can't be tested at all.
-- These files will be locked: the implementer can't edit them.
+- These files will be locked: the implementer can't edit them.""" + DATA_FILE_HINT + """
 Your final answer must be the structured report."""
+
+
+DATA_SUFFIXES = (".json", ".csv", ".tsv", ".yaml", ".yml", ".xml", ".ndjson", ".jsonl")
+DATA_LINES = 300  # a test file with more changed lines than this is treated as data
+
+
+def _patch_files(patch: str) -> list[tuple[str, str, int]]:
+    """(path, that file's part of the diff, changed lines) per file of a `git diff`."""
+    out: list[tuple[str, str, int]] = []
+    for chunk in re.split(r"(?m)^(?=diff --git )", patch):
+        if not chunk.startswith("diff --git "):
+            continue
+        m = re.search(r"(?m)^\+\+\+ b/(.+)$", chunk) or re.search(r"^diff --git a/\S+ b/(.+)$", chunk, re.M)
+        path = m.group(1).strip() if m else "?"
+        changed = sum(1 for line in chunk.splitlines()
+                      if line[:1] in ("+", "-") and not line.startswith(("+++ ", "--- ")))
+        out.append((path, chunk, changed))
+    return out
+
+
+def parent_tests_note(parent_id: str, patch: str, limit_chars: int = 20_000) -> str:
+    """For a card split from a test-first card: the tests its parent's test writer wrote, as a
+    starting point. Test code is shown (up to `limit_chars`); data files only by path and size,
+    so they aren't copied wholesale into each child."""
+    shown, listed = [], []
+    used = 0
+    for path, chunk, changed in _patch_files(patch):
+        if path.lower().endswith(DATA_SUFFIXES) or changed > DATA_LINES:
+            listed.append(f"- {path} ({changed} lines, data: not shown)")
+        elif used + len(chunk) > limit_chars:
+            listed.append(f"- {path} ({changed} lines, not shown: over the size cap)")
+        else:
+            shown.append(chunk.rstrip("\n"))
+            used += len(chunk)
+    if not shown and not listed:
+        return ""
+    parts = [f"## Tests written for {parent_id} before it was split",
+             f"This card was split from {parent_id}, whose acceptance tests were written but not kept. "
+             "Use them as a starting point: keep and adapt the tests that cover this card's criteria, "
+             "drop the rest. Don't copy the data files wholesale: generate large expected data at test "
+             "time, or keep a small hand-trimmed sample."]
+    if listed:
+        parts.append("Files not shown:\n" + "\n".join(listed))
+    if shown:
+        parts.append("```diff\n" + "\n".join(shown) + "\n```")
+    return "\n\n".join(parts)
 
 
 def sizing_rules(cfg: Config) -> str:
@@ -316,6 +380,8 @@ size is thrown away and split, so size cards before work starts:
 - Split any card estimated above {split_at} lines into cards ordered with depends_on.
 - Generated or example data (JSON payloads, fixtures, snapshots, seed data) counts in full. Keep
   committed examples small and hand-trimmed, and build full data at test time instead.
+- A data file copied into the repo is a sizing risk: plan a compact form (one record per line)
+  with a round-trip test, or build it at test time; generated folders belong in diff_exclude.
 - Say in size_notes what dominates the size."""
 
 
@@ -585,7 +651,8 @@ class ClaudeRunner:
 
     def _editor_options(self, cfg: Config, task: Task, worktree: Path, graph: Path | None,
                         resume: str | None, env: dict | None, model: str, append: str,
-                        schema: dict, locked: list[str] | None = None, stop_gate: bool = False):
+                        schema: dict, locked: list[str] | None = None, stop_gate: bool = False,
+                        size_role: str = "worker"):
         """Options for an agent that edits files in the worktree (worker, test writer)."""
         from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
         from .gates import SIZE_TOOLS, make_size_guard, make_stop_gate
@@ -600,9 +667,15 @@ class ClaudeRunner:
         if stop_gate and cfg.gates_on_stop and fast:
             hooks["Stop"] = [HookMatcher(hooks=[make_stop_gate(fast, worktree, env=env)],
                                          timeout=sum(g.timeout_s for g in fast) + 30)]
-        if stop_gate and task.base_commit:  # workers: hear about size while there's time to stop
-            guard = make_size_guard(worktree, task.base_commit, cfg.max_diff_lines,
-                                    list(cfg.diff_exclude) + list(locked or []))
+        if task.base_commit and (stop_gate or size_role == "test_writer"):
+            # hear about size while there's time to stop: workers against the diff gate, test
+            # writers against their own budget (locked tests don't count toward the gate)
+            if size_role == "test_writer":
+                guard = make_size_guard(worktree, task.base_commit, cfg.test_max_lines or cfg.max_diff_lines,
+                                        list(cfg.diff_exclude), role="test_writer")
+            else:
+                guard = make_size_guard(worktree, task.base_commit, cfg.max_diff_lines,
+                                        list(cfg.diff_exclude) + list(locked or []))
             hooks["PostToolUse"] = [HookMatcher(matcher=SIZE_TOOLS, hooks=[guard], timeout=60)]
         return ClaudeAgentOptions(
             cwd=str(worktree), model=model,
@@ -628,13 +701,16 @@ class ClaudeRunner:
         return await self._run(prompt, opts, task.id)
 
     async def write_tests(self, cfg: Config, task: Task, worktree: Path, graph: Path | None = None,
-                          resume: str | None = None, env: dict | None = None) -> AgentResult:
+                          resume: str | None = None, env: dict | None = None,
+                          reference: str = "") -> AgentResult:
         """Test-first: write failing acceptance tests for the card (its own session id is
-        returned; the caller keeps it separate from the worker's)."""
+        returned; the caller keeps it separate from the worker's). `reference`: tests written
+        for the card this one was split from."""
         opts = self._editor_options(cfg, task, worktree, graph, resume, env, cfg.test_writer_model,
-                                    TEST_WRITER_APPEND, TESTS_SCHEMA)
+                                    TEST_WRITER_APPEND, TESTS_SCHEMA, size_role="test_writer")
         prompt = resume if (resume and task.session_id) else (
-            task_card(task) + "\n\nWrite the acceptance tests for this card now (tests only).")
+            task_card(task) + (f"\n\n{reference.strip()}" if reference.strip() else "")
+            + "\n\nWrite the acceptance tests for this card now (tests only).")
         return await self._run(prompt, opts, f"{task.id}:tests")
 
     def _checker_options(self, cfg: Config, worktree: Path, graph: Path | None, model: str,
@@ -646,13 +722,16 @@ class ClaudeRunner:
         servers, allowed, guide = _graph_opts(cfg, graph, base)
         sandbox = sandbox_settings(cfg) if shell else None
         guard = make_reviewer_guard(worktree) if shell else make_read_guard(worktree)
+        pre = [HookMatcher(hooks=[guard])]
+        if shell and cfg.agents.bash_output_max_chars:  # as for workers: head + tail of long output
+            pre.append(HookMatcher(matcher="Bash", hooks=[make_output_cap(cfg.agents.bash_output_max_chars)]))
         return ClaudeAgentOptions(
             cwd=str(worktree), model=model,
             system_prompt=system + (SANDBOX_NOTE if sandbox else "") + guide + _context(cfg),
             tools=base, allowed_tools=allowed, mcp_servers=servers, strict_mcp_config=True,
             setting_sources=["project"], max_turns=max_turns, max_budget_usd=cfg.task_budget_usd,
             session_id=_new_session(), env={**agent_env(cfg), **(env or {})}, sandbox=sandbox,
-            hooks={"PreToolUse": [HookMatcher(hooks=[guard])]},
+            hooks={"PreToolUse": pre},
             output_format={"type": "json_schema", "schema": schema},
         )
 

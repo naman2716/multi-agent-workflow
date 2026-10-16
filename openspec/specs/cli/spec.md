@@ -28,3 +28,19 @@ SHALL print a ticket as plan input.
 ### Requirement: Shipping is opt-in per project
 A configuration without a `[ship]` section SHALL NOT push or open PRs; `orchestra init` SHALL
 write `[ship].auto = true`.
+
+### Requirement: Usage report
+`orchestra usage <export-dir>` SHALL report tokens by type (counted once per message id),
+estimated USD from one price table, the CLI's own totals, cold starts, resume rounds and large
+tool outputs, per card, role, model and session, joined with the card's recorded cost, status,
+gate failures and reviews; as a table, Markdown, JSON or CSV. Recorded session roles SHALL be
+preferred over prompt-shape guesses.
+
+### Requirement: Card status lists sessions
+`orchestra status <card>` SHALL list the card's agent sessions with role, model, runs, cost and
+end reason.
+
+### Requirement: [git] section
+`orchestra.toml` SHALL accept a `[git]` section (`author`, `co_author`, `run_hooks`); invalid
+`author` or `co_author` values SHALL be config errors. `orchestra init` SHALL write the section
+with comments.

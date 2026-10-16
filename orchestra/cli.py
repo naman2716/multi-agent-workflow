@@ -35,7 +35,7 @@ from pathlib import Path
 
 from .agents import ClaudeRunner
 from .config import CONFIG_TEMPLATE, Config, detect_gates, render_gates
-from .gitops import IdentityError, resolve_identity
+from .gitops import IdentityError, SyncError, resolve_identity
 from .graph import Graph, GraphData, graphify_available
 from .orchestrator import Orchestrator
 from .planning import PlanError, build_tasks, plan_fingerprint, render_plan, save_plan
@@ -59,9 +59,24 @@ def _graph(cfg: Config) -> Graph:
                  log=lambda m: print(f"[graph] {m}"))
 
 
-async def cfg_integration(cfg: Config) -> None:
+async def cfg_integration(cfg: Config, allow_diverged: bool = False, move: bool = True,
+                          create: bool = True) -> None:
+    """Bring the integration branch up to the base branch (see Git.sync_integration) and say
+    what changed. Raises SyncError when they have diverged, unless allowed."""
     from .gitops import Git
-    await Git(cfg.repo, cfg.worktree_root, cfg.base_branch, cfg.integration_branch).ensure_integration_branch()
+    res = await Git(cfg.repo, cfg.worktree_root, cfg.base_branch, cfg.integration_branch).sync_integration(
+        allow_diverged=allow_diverged, move=move, create=create)
+    if msg := res.message(cfg.base_branch, cfg.integration_branch):
+        print(f"note: {msg}")
+
+
+def _sync_integration(cfg: Config, store: Store, allow_diverged: bool, create: bool = False) -> None:
+    """approve/add/plan: sync before queueing; with a live run, only report (never move its ref)."""
+    from .gitops import SyncError
+    try:
+        asyncio.run(cfg_integration(cfg, allow_diverged, move=not store.live_lease(), create=create))
+    except SyncError as e:
+        sys.exit(f"Stopped: {e}")
 
 
 def _graph_data(cfg: Config) -> GraphData | None:
@@ -142,7 +157,7 @@ def plan_with_critic(cfg: Config, store: Store, goal: str, runner, verbose: bool
     state: dict = {}
 
     async def _plan():
-        await cfg_integration(cfg)
+        await cfg_integration(cfg, allow_diverged=True, move=False)  # cmd_plan synced it already
         g = _graph(cfg)
         snap = await g.snapshot("planner") if cfg.graph.enabled else None
         cwd = g.wt if snap else await Git(cfg.repo, cfg.worktree_root, cfg.base_branch,
@@ -195,6 +210,7 @@ def cmd_plan(args) -> None:
         print(goal.splitlines()[0])
     elif not goal.strip():
         sys.exit('Give a goal (orchestra plan "...") or a ticket (orchestra plan --linear ENG-123).')
+    _sync_integration(cfg, store, args.allow_diverged, create=True)
     plan, issues, cost, cwd, graph_data = plan_with_critic(cfg, store, goal,
                                                            ClaudeRunner(verbose=args.verbose))
     plan_path = cfg.state_path / "plan.json"
@@ -225,6 +241,28 @@ def _split_at(cfg: Config) -> int:
     return int(cfg.max_diff_lines * cfg.split_above)
 
 
+def _refuse_unestimated(cfg: Config, tasks: list[Task]) -> None:
+    """With [planning] require_estimates: exit (nothing queued) if any card has no estimate."""
+    missing = [t.id for t in tasks if t.estimated_lines <= 0]
+    if cfg.planning.require_estimates and missing:
+        sys.exit(f"Not queued: {', '.join(missing)} {'has' if len(missing) == 1 else 'have'} no "
+                 f"estimated_lines and [planning] require_estimates is on. Add estimates (split "
+                 f"anything above {_split_at(cfg)} lines) and approve again.")
+
+
+def _warn_stale_harness(cfg: Config) -> None:
+    from .harness import stale_files
+    try:
+        stale = stale_files(cfg)
+    except Exception:  # a broken check must never stop approve or run
+        return
+    if stale:
+        names = ", ".join(sorted({Path(p).parent.name if p.endswith("SKILL.md") else Path(p).stem
+                                  for p in stale}))
+        print(f"note: harness files differ from this Orchestra ({names}); they're older or were "
+              "edited. Run `orchestra harness install` and commit the result.")
+
+
 def cmd_approve(args) -> None:
     cfg = Config.load(_repo(args))
     store = _store(cfg)
@@ -232,9 +270,12 @@ def cmd_approve(args) -> None:
     plan = json.loads(path.read_text())
     if _already_queued(store, plan, args.force):
         return
+    _sync_integration(cfg, store, args.allow_diverged)
     tasks, warnings = build_tasks(plan, start=len(store.all()) + 1, graph=_graph_data(cfg),
                                   existing=store.open_tasks(), split_at=_split_at(cfg))
     print(render_plan(tasks, warnings, plan))
+    _refuse_unestimated(cfg, tasks)
+    _warn_stale_harness(cfg)
     source = plan.get("source") if isinstance(plan.get("source"), dict) else None
     _queue(store, tasks, plan, plan.get("goal", ""), source)
     print(f"\nQueued {len(tasks)} tasks.")
@@ -248,11 +289,13 @@ def cmd_add(args) -> None:
     items = data if isinstance(data, list) else data.get("tasks", [data])
     if _already_queued(store, {"tasks": items}, args.force):
         return
+    _sync_integration(cfg, store, args.allow_diverged)
     tasks, warnings = build_tasks({"tasks": items}, start=len(store.all()) + 1, graph=_graph_data(cfg),
                                   existing=store.open_tasks(), split_at=_split_at(cfg))
-    _queue(store, tasks, {"tasks": items})
     for w in warnings:
         print("note:", w)
+    _refuse_unestimated(cfg, tasks)
+    _queue(store, tasks, {"tasks": items})
     print(f"Added {', '.join(t.id for t in tasks)}")
 
 
@@ -275,19 +318,24 @@ def cmd_run(args) -> None:
         sys.exit(3)
     # running/review cards with no live run were interrupted; the run will recover them
     phone = bool(cfg.ntfy.enabled and cfg.ntfy.reply_topic and cfg.ntfy.reply_topic != cfg.ntfy.topic)
+    reship = bool(cfg.ship.auto and store.get_meta("ship_pending"))  # a run died while shipping
     if not any(t.status in ("pending", "running", "review") for t in store.all()) \
-            and not (phone and store.waiting()):
+            and not (phone and store.waiting()) and not reship:
         waiting = store.waiting()
         sys.exit(f"Nothing pending; {len(waiting)} card(s) wait for your decision (orchestra decisions)."
                  if waiting else "Nothing pending. Use `orchestra plan` or `orchestra add` first.")
+    if args.detach:
+        return _detach_run(cfg, args)
     try:
         sys.stdout.reconfigure(line_buffering=True)  # live output when piped (e.g. /dispatch)
     except (AttributeError, ValueError):
         pass
+    _warn_stale_harness(cfg)
     interactive = cfg.ask_in_terminal and not args.no_ask and sys.stdin.isatty()
     from .asking import TerminalInput
     orch = Orchestrator(cfg, store, ClaudeRunner(verbose=args.verbose),
                         asker=TerminalInput() if interactive else None)
+    orch.allow_diverged = args.allow_diverged
     if interactive:
         print("Agents' questions will appear here as they come up.")
     try:
@@ -296,12 +344,46 @@ def cmd_run(args) -> None:
         print(f"{e}.\nWatch it with `orchestra status`; only one run works the queue at a time.",
               file=sys.stderr)
         sys.exit(3)
+    except SyncError as e:
+        sys.exit(f"Not started: {e}")
     if orch.pr:
         print(f"\nDraft PR: {orch.pr['url']} (CI {orch.pr['ci']})")
     else:
         print(f"\nReview the result: git log {cfg.base_branch}..{cfg.integration_branch}, "
               f"then `orchestra ship` (or open a PR from {cfg.integration_branch}).")
     sys.exit(0 if counts["blocked"] == 0 else 2)
+
+
+def _popen(*args, **kw) -> subprocess.Popen:
+    return subprocess.Popen(*args, **kw)
+
+
+def _detach_run(cfg: Config, args) -> None:
+    """Start this run in its own process session, so it outlives the terminal or Claude Code
+    session that started it, with output appended to <state>/run.log."""
+    import os
+    log = cfg.state_path / "run.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [sys.executable, "-m", "orchestra.cli", "-C", str(cfg.repo), "run", "--no-ask"]
+    if args.concurrency:
+        cmd += ["-j", str(args.concurrency)]
+    if args.budget:
+        cmd += ["--budget", str(args.budget)]
+    cmd += [flag for flag, on in (("-v", args.verbose), ("--no-wait", args.no_wait),
+                                  ("--allow-diverged", args.allow_diverged)) if on]
+    # the same Orchestra code as this process, whatever the child's working directory
+    pkg_parent = str(Path(__file__).resolve().parents[1])
+    env = {**os.environ, "PYTHONUNBUFFERED": "1",
+           "PYTHONPATH": os.pathsep.join([pkg_parent, *filter(None, [os.environ.get("PYTHONPATH")])])}
+    with open(log, "a") as out:
+        out.write(f"\n--- orchestra run started {time.strftime('%Y-%m-%d %H:%M:%S')} (detached) ---\n")
+        out.flush()
+        proc = _popen(cmd, cwd=cfg.repo, stdin=subprocess.DEVNULL, stdout=out,
+                      stderr=subprocess.STDOUT, start_new_session=True, env=env)
+    rel = log.relative_to(cfg.repo) if log.is_relative_to(cfg.repo) else log
+    print(f"Run started in the background (pid {proc.pid}); output goes to {rel}.\n"
+          f"It keeps going if this terminal or session ends. Follow it with `tail -f {rel}` "
+          "or `orchestra status`; answer questions with `orchestra decisions` / `orchestra answer`.")
 
 
 def cmd_status(args) -> None:
@@ -362,9 +444,68 @@ def cmd_retry(args) -> None:
     fields = {"status": "pending", "attempts": 0}
     if args.model:
         fields["model"] = args.model
+    reset = t.triaged and not args.keep_triage  # a human re-queue earns a fresh triage
+    if reset:
+        fields["triaged"] = False
     store.update(args.task, **fields)
-    store.log(args.task, "retry", "re-queued by human")
-    print(f"{args.task} re-queued.")
+    store.log(args.task, "retry", "re-queued by human" + (" (triage reset)" if reset else ""))
+    print(f"{args.task} re-queued" + (" (it can be triaged again)." if reset else "."))
+
+
+def _read_list(path: str) -> list[str]:
+    """A JSON list of strings, or one item per non-empty line."""
+    text = Path(path).read_text()
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return [line.strip() for line in text.splitlines() if line.strip()]
+    if not (isinstance(data, list) and all(isinstance(x, str) for x in data)):
+        sys.exit(f"{path}: expected a JSON list of strings, or one item per line")
+    return data
+
+
+def cmd_edit(args) -> None:
+    from .cards import CardError, edit_card
+    cfg = Config.load(_repo(args))
+    store = _store(cfg)
+    try:
+        changes = edit_card(
+            store, args.task, force=args.force, state_dir=cfg.state_dir,
+            handoff_dir=cfg.state_path / "handoffs",
+            depends_on=args.depends_on.split(",") if args.depends_on is not None else None,
+            scope=args.scope, scope_add=args.scope_add, scope_remove=args.scope_remove,
+            acceptance=_read_list(args.acceptance_file) if args.acceptance_file else None,
+            acceptance_add=args.acceptance_add,
+            spec=Path(args.spec_file).read_text() if args.spec_file else None,
+            title=args.title, non_goals=_read_list(args.non_goals_file) if args.non_goals_file else None)
+    except (CardError, KeyError) as e:
+        sys.exit(str(e).strip("'\""))
+    print(f"{args.task}: " + ("; ".join(changes) if changes else "nothing changed"))
+
+
+def cmd_split(args) -> None:
+    from .cards import CardError, check_editable, split_card
+    cfg = Config.load(_repo(args))
+    store = _store(cfg)
+    t = store.get(args.task)
+    data = json.loads(Path(args.file).read_text())
+    items = data if isinstance(data, list) else data.get("tasks", [])
+    try:
+        check_editable(store, t, args.force)
+        if t.status == "cancelled" and not args.force:
+            raise CardError(f"{t.id} is cancelled{f' ({t.summary})' if t.summary else ''}; use --force")
+        ids, notes = split_card(store, t, items, args.why or "split by hand", split_at=_split_at(cfg),
+                                source="human")
+    except CardError as e:
+        sys.exit(str(e))
+    for n in notes:
+        print("note:", n)
+    print(f"{t.id} split into {', '.join(ids)}")
+    for i in ids:
+        c = store.get(i)
+        print(f"  {i} {c.title}" + (f"  (after {', '.join(c.depends_on)})" if c.depends_on else ""))
+    if waiting := [x.id for x in store.all() if any(i in x.depends_on for i in ids) and x.id not in ids]:
+        print(f"now waiting for them: {', '.join(waiting)}")
 
 
 def cmd_model(args) -> None:
@@ -411,8 +552,9 @@ def _print_decision(t) -> None:
     print(f"  Q: {d.get('question', '')}")
     if d.get("why_it_matters"):
         print(f"  why it matters: {d['why_it_matters']}")
+    from .asking import scope_note
     for i, o in enumerate(d.get("options", []), 1):
-        print(f"   {i}. {o}")
+        print(f"   {i}. {o}{scope_note(d, i)}")
     if d.get("recommendation"):
         print(f"  agent recommends: {d['recommendation']}")
     if d.get("work_so_far"):
@@ -450,11 +592,44 @@ def cmd_answer(args) -> None:
         answer = input("\nYour decision: ").strip() if sys.stdin.isatty() else ""
         if not answer:
             sys.exit("no answer given")
+    from .cards import clean_scope_paths
+    extra, bad = clean_scope_paths(args.scope_add or [], cfg.state_dir)
+    if bad:
+        sys.exit(f"--scope-add can't grant {', '.join(bad)}: use repo-relative paths, no '..', "
+                 "nothing under .git/ or the state directory")
     try:
-        store.answer(args.task, answer)
+        before = t.files_scope
+        t = store.answer(args.task, answer, pick=args.pick, scope_add=extra)
     except ValueError as e:
         sys.exit(str(e))
-    print(f"{args.task} will resume with: {answer}\nRun `orchestra run` (or /dispatch) to continue.")
+    print(f"{args.task} will resume with: {answer}")
+    if added := [p for p in t.files_scope if p not in before]:
+        print(f"files_scope now also includes: {', '.join(added)}")
+    print("Run `orchestra run` (or /dispatch) to continue.")
+
+
+def cmd_scope(args) -> None:
+    from .cards import CardError, check_editable, clean_scope_paths, narrow_scope, widen_scope
+    cfg = Config.load(_repo(args))
+    store = _store(cfg)
+    t = store.get(args.task)
+    add, bad = clean_scope_paths(args.add or [], cfg.state_dir)
+    if bad:
+        sys.exit(f"can't add {', '.join(bad)}: use repo-relative paths, no '..', "
+                 "nothing under .git/ or the state directory")
+    try:
+        check_editable(store, t, args.force)
+        removed = narrow_scope(store, t.id, args.remove or [])
+        added = widen_scope(store, t.id, add, "by hand")
+    except CardError as e:
+        sys.exit(str(e))
+    if not t.files_scope and add:
+        print(f"{t.id} has no files_scope (unrestricted); nothing to add.")
+    t = store.get(t.id)
+    print(f"{t.id} scope: {', '.join(t.files_scope) or 'unrestricted'}"
+          + (f"  (+{', '.join(added)})" if added else "") + (f"  (-{', '.join(removed)})" if removed else ""))
+    if t.depends_on:
+        print(f"depends on: {', '.join(t.depends_on)}")
 
 
 def cmd_models(args) -> None:
@@ -635,14 +810,20 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--linear", metavar="TICKET", help="plan from a Linear ticket, e.g. ENG-123")
     s.add_argument("--approve", action="store_true")
     s.add_argument("-v", "--verbose", action="store_true"); s.set_defaults(fn=cmd_plan)
+    s.add_argument("--allow-diverged", action="store_true", help="proceed although the integration branch has diverged from base")
     s = sub.add_parser("approve"); s.add_argument("plan", nargs="?")
     s.add_argument("--force", action="store_true", help="queue even if this plan was queued before")
+    s.add_argument("--allow-diverged", action="store_true", help="proceed although the integration branch has diverged from base")
     s.set_defaults(fn=cmd_approve)
     s = sub.add_parser("add"); s.add_argument("file")
     s.add_argument("--force", action="store_true", help="queue even if these cards were queued before")
+    s.add_argument("--allow-diverged", action="store_true", help="proceed although the integration branch has diverged from base")
     s.set_defaults(fn=cmd_add)
     s = sub.add_parser("run"); s.add_argument("-j", "--concurrency", type=int)
     s.add_argument("--budget", type=float); s.add_argument("-v", "--verbose", action="store_true")
+    s.add_argument("--detach", action="store_true",
+                   help="run in the background, in its own session (survives this terminal); log in <state>/run.log")
+    s.add_argument("--allow-diverged", action="store_true", help="proceed although the integration branch has diverged from base")
     s.add_argument("--no-ask", action="store_true",
                    help="don't ask questions in this terminal (answer later with orchestra answer)")
     s.add_argument("--no-wait", action="store_true",
@@ -652,6 +833,8 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("retry"); s.add_argument("task"); s.add_argument("--note")
     s.add_argument("--model", help="run this card on a specific model, e.g. opus")
     s.add_argument("--force", action="store_true", help="re-queue even a merged or running card")
+    s.add_argument("--keep-triage", action="store_true",
+                   help="don't reset the card's one triage (by default a retry earns a fresh one)")
     s.set_defaults(fn=cmd_retry)
     s = sub.add_parser("test-first", help="have locked acceptance tests written before the worker starts")
     s.add_argument("task"); s.add_argument("--off", action="store_true", help="turn it off")
@@ -667,7 +850,29 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("answer", help="answer an agent's question; it resumes on the next run")
     s.add_argument("task"); s.add_argument("text", nargs="?")
     s.add_argument("--pick", type=int, help="choose option N"); s.add_argument("--recommended", action="store_true")
+    s.add_argument("--scope-add", nargs="+", metavar="GLOB", help="also add these paths to the card's files_scope")
     s.set_defaults(fn=cmd_answer)
+    s = sub.add_parser("edit", help="change an open card: dependencies, scope, criteria, spec, title")
+    s.add_argument("task")
+    s.add_argument("--depends-on", metavar="IDS", help="comma-separated card ids ('' for none)")
+    s.add_argument("--scope", nargs="+", metavar="GLOB", help="replace files_scope")
+    s.add_argument("--scope-add", nargs="+", metavar="GLOB"); s.add_argument("--scope-remove", nargs="+", metavar="GLOB")
+    s.add_argument("--acceptance-file", metavar="FILE", help="replace the criteria (JSON list or one per line)")
+    s.add_argument("--acceptance-add", action="append", metavar="TEXT", help="add a criterion (repeatable)")
+    s.add_argument("--spec-file", metavar="FILE"); s.add_argument("--title")
+    s.add_argument("--non-goals-file", metavar="FILE")
+    s.add_argument("--force", action="store_true", help="edit a merged card, or one in a live run")
+    s.set_defaults(fn=cmd_edit)
+    s = sub.add_parser("split", help="split a card into the cards in a plan file (dependents are rewired)")
+    s.add_argument("task"); s.add_argument("file", help='plan file: {"tasks": [...]} or a list of cards')
+    s.add_argument("--why", help="reason, noted on each new card")
+    s.add_argument("--force", action="store_true", help="split a merged or cancelled card, or one in a live run")
+    s.set_defaults(fn=cmd_split)
+    s = sub.add_parser("scope", help="add or remove files_scope paths on a card")
+    s.add_argument("task"); s.add_argument("--add", nargs="+", metavar="GLOB")
+    s.add_argument("--remove", nargs="+", metavar="GLOB")
+    s.add_argument("--force", action="store_true", help="change a merged card, or one in a live run")
+    s.set_defaults(fn=cmd_scope)
     s = sub.add_parser("models", help="show the model used by each role"); s.set_defaults(fn=cmd_models)
     s = sub.add_parser("graph", help="build/inspect the Graphify code graph")
     s.add_argument("action", choices=["build", "status", "query", "affected", "explain", "benchmark"])

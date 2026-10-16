@@ -76,6 +76,7 @@ def build_files(cfg: Config, graph: bool) -> dict[str, str]:
                "mcp__graph__shortest_path"] if graph else []
     guide = GRAPH_GUIDE if graph else ""
     integ, base = cfg.integration_branch, cfg.base_branch
+    log = f"{cfg.state_dir.rstrip('/')}/run.log"
     files: dict[str, str] = {}
 
     files[".claude/agents/orchestra-planner.md"] = _agent(
@@ -122,15 +123,18 @@ any agent writes code. Tight cards are the most important quality gate in the sy
    explicitly out of scope. Ask before guessing.
 2. Explore the code read-only to ground the plan.
 {graph_step}3. Draft cards following these rules:
-   - vertical slices, each reviewable as one small diff (aim under ~300 changed lines);
+   - vertical slices, each reviewable as one small diff that fits the Sizing rules below;
    - `files_scope` specific; cards that could run at the same time must not share files;
    - shared foundations (schema, types, interfaces) first, dependents list them in `depends_on`;
    - acceptance criteria are concrete and testable; `non_goals` name tempting extras;
    - `test_first: true` on cards that change money, stored data or auth/permissions: a separate
      agent writes locked acceptance tests from the criteria before the worker starts, so make
-     those criteria precise. Confirm these flags with the user.
+     those criteria precise. Confirm these flags with the user;
+   - every card has `estimated_lines` (see Sizing); split any card above the threshold before
+     showing it.
    You can delegate a first draft to the `orchestra-planner` subagent, then refine it together.
-4. Show the cards as a short table (id, title, scope, depends on) and iterate with the user.
+4. Show the cards as a short table (id, title, scope, depends on, est. lines) and iterate with
+   the user.
 5. When the user approves, write the plan to `.orchestra/plan.json` in this shape:
 {_plan_format()}
    Add `"goal": "<one-line goal>"` at the top (it becomes the PR title). For a Linear ticket
@@ -138,7 +142,7 @@ any agent writes code. Tight cards are the most important quality gate in the sy
 6. Run `orchestra approve`. It validates the graph, adds dependency edges where scopes overlap
    {"or code is coupled " if graph else ""}and queues the cards. Show its output.
 7. Suggest `/dispatch` to run them.
-""")
+""" + sizing_rules(cfg))
 
     files[".claude/skills/dispatch/SKILL.md"] = _skill(
         "dispatch",
@@ -150,10 +154,12 @@ any agent writes code. Tight cards are the most important quality gate in the sy
 1. Run `orchestra status`. If nothing is pending, say so and suggest `/groom`.
 2. Confirm concurrency and budget with the user if they haven't said (defaults come from
    orchestra.toml). Rate limits are shared with this session, so 2–4 workers is typical.
-3. Start the run in the background: `orchestra run -j <N>` (use run_in_background), so this
-   session stays free for the user. Each card gets its own worktree, automated gates, an
-   independent reviewer, and is merged into `{integ}`, never into `{base}`.
-4. Keep an eye on the run's output while it works. When a line says
+3. Start the run detached: `orchestra run --detach -j <N>`. It runs in its own process
+   session, so it keeps going if this Claude Code session ends or restarts, and its output
+   goes to `{log}`. Each card gets its own worktree, automated gates, an independent
+   reviewer, and is merged into `{integ}`, never into `{base}`.
+4. Keep an eye on the run while it works: read the end of `{log}` (`tail -n 40 {log}`) and
+   `orchestra status` every few minutes. When a line says
    `needs your decision`, bring it to the user right away; don't wait for the run to end:
    run `orchestra decisions`, then ask with AskUserQuestion using the agent's options (mark
    the recommended one; the user can also type their own answer). Record it exactly with
@@ -172,6 +178,10 @@ any agent writes code. Tight cards are the most important quality gate in the sy
    Red CI became a fix card automatically (up to `[ship].ci_fix_rounds` times); say whether
    it went green.
 8. Suggest `/review-integration` to review what landed.
+
+If this session restarts, the run is still going: check `orchestra status` and the log. A run
+that was killed anyway can simply be started again; it resumes interrupted cards, and if it was
+killed while shipping, it ships again and waits for CI.
 
 Tip for the user: running `orchestra run` in their own terminal instead shows questions
 right there as they come up, with numbered options to answer inline.
@@ -283,6 +293,19 @@ def _merge_mcp(path: Path, interpreter: str) -> None:
         "type": "stdio", "command": interpreter,
         "args": ["-m", "graphify.serve", "graphify-out/graph.json"]}
     path.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def stale_files(cfg: Config) -> list[str]:
+    """Installed agent and skill files that differ from what this Orchestra would write (with
+    or without the graph). Harness files are usually committed, so an upgrade doesn't reach
+    them until `orchestra harness install` runs again. Files that aren't installed don't count."""
+    fresh = [build_files(cfg, graph=g) for g in (True, False)]
+    out = []
+    for rel in fresh[0]:
+        p = cfg.repo / rel
+        if p.is_file() and all(p.read_text() != f[rel] for f in fresh):
+            out.append(rel)
+    return out
 
 
 def install_harness(cfg: Config, graph: bool = True, git_hooks: bool = True) -> list[str]:

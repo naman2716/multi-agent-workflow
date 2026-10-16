@@ -23,6 +23,7 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
+from .asking import scope_note
 from .config import NtfySettings
 
 MAX_ACTIONS = 3  # ntfy shows at most three buttons
@@ -119,7 +120,7 @@ class Ntfy:
             lines += ["", f"Why it matters: {d['why_it_matters']}"]
         if opts:
             lines.append("")
-            lines += [f"{i}. {o}" for i, o in enumerate(opts, 1)]
+            lines += [f"{i}. {o}{scope_note(d, i)}" for i, o in enumerate(opts, 1)]
         if rec:
             lines += ["", f"Recommended: {rec}"]
         actions: list[dict] = []

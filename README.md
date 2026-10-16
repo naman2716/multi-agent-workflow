@@ -141,6 +141,11 @@ main, force-pushes), an Orchestra section in CLAUDE.md, and, with Graphify, its 
 hooks, its git hooks (graph rebuilt on every commit/checkout of your checkout) and an MCP
 server in `.mcp.json`. Existing settings and CLAUDE.md content are merged, never overwritten.
 
+The agent and skill files are generated from this Orchestra version and are usually committed, so
+upgrading Orchestra doesn't change them by itself (`orchestra init` never touches them). After an
+upgrade, run `orchestra harness install` again and commit the result. `orchestra approve` and
+`orchestra run` print a note when the installed files differ from what this version would write.
+
 ### Code knowledge graph (Graphify)
 
 With `[graph] enabled = true` (set automatically by `orchestra init` when Graphify is
@@ -174,6 +179,21 @@ You can also skip the planner and queue hand-written cards: `orchestra add cards
 (same fields as a plan task: key, title, spec, acceptance_criteria, non_goals, files_scope,
 depends_on, complexity).
 
+Fix an open card without touching `state.db`:
+
+```bash
+orchestra edit T16 --depends-on T15,T29          # '' for none; cycles and unknown ids are refused
+orchestra edit T15 --acceptance-file crit.json   # also --acceptance-add, --spec-file, --title,
+                                                 #   --scope / --scope-add / --scope-remove
+orchestra split T15 split.json --why "621 lines" # same path as triage's split
+```
+
+Every edit is logged and noted on the card for the next worker. New criteria or spec on a
+test-first card discard its locked tests. `split` cancels the card as "split into …", and cards
+that waited for it wait for all the new ones. Unlike triage, a hand split may reach outside the
+original scope (it says so), and its cards can be triaged. Merged cards, and cards in a live run,
+need `--force`.
+
 ## Agents ask you when it matters
 
 A worker that hits a choice the card doesn't settle and that affects users, money or data
@@ -201,6 +221,13 @@ question stays readable):
 
 The agent resumes its own session right away, in the same run. `2: but round up` picks an
 option with a tweak (your note wins where they differ). `later` leaves it open.
+
+**Options that need more files say so.** When an option means editing files outside the card's
+`files_scope` (a model, a migration), the worker lists them and the question shows
+`(adds to scope: …)` after that option. Picking it, from any channel, adds those paths to the
+card, logs it, and makes the card wait for open cards on the same files. To add paths yourself:
+`orchestra answer T17 --pick 1 --scope-add 'backend/alembic/versions/*'`, or
+`orchestra scope T17 --add <glob> [--remove <glob>]` for a card that isn't waiting.
 
 **Elsewhere, it's picked up live.** When the run has no terminal (e.g. started by `/dispatch`
 in Claude Code), it keeps going for up to `decision_wait_minutes` (default 60) after
@@ -257,6 +284,14 @@ before implementation, the run log and the reviewer get a warning. The reviewer 
 check that the change doesn't stop them from running (skip markers, conftest or test-config
 edits); Orchestra doesn't check that itself.
 
+Since locked tests don't count toward the gate, the test writer gets its own size check: past
+80% of `[quality].test_max_lines` (default `max_diff_lines`), and again past it, it is told to
+cover each criterion once and to generate large expected data at test time. A card that can't be
+tested within the budget is reported blocked and goes to triage, before any worker runs. When
+triage (or `orchestra split`) splits a test-first card whose tests were already written, each new
+card's test writer starts from them: the parent's test code is in its prompt (up to 20k chars),
+and data files are listed by name and size only.
+
 ## Self-healing: triage before a card is blocked
 
 When a card uses up its attempts, or its worker (or test writer) reports it can't proceed, a
@@ -274,7 +309,9 @@ last work report and review, looks at the code at the integration head, and pick
 - **human**: it stays blocked, with the triage note on the card and in the notification.
 
 Each card is triaged at most once, never past the run budget, and you're notified of what it
-did (`orchestra status T03` shows it). `[autonomy].triage_actions` limits what is applied
+did (`orchestra status T03` shows it). `orchestra retry` gives the card a fresh triage (unless
+`--keep-triage`), so a triage spent on, say, a stale branch doesn't send its next real block
+straight to you. `[autonomy].triage_actions` limits what is applied
 automatically (others become a note for you); `triage = false` turns it off. If a usage limit
 stops a triage, it runs at the start of the next run.
 
@@ -298,6 +335,15 @@ You get the PR link (and CI result) in the run output, `orchestra status` and a 
 Needs the GitHub CLI logged in (`gh auth login`) on the machine that runs Orchestra; without a
 remote or `gh` it says so and the run still succeeds. `orchestra ship` does the same by hand
 (`--no-wait` to skip CI).
+
+If a run is killed while shipping (say, during the CI wait), the next `orchestra run` ships again
+and waits for CI, even with nothing else to do.
+
+**Runs that outlive their session.** `orchestra run --detach` starts the run in its own process
+session, with output appended to `.orchestra/run.log`, and returns at once. Closing the terminal
+or restarting Claude Code doesn't stop it, and `/dispatch` starts runs this way. A detached run
+can't ask in the terminal, so answer with `orchestra decisions` / `orchestra answer`, `/decide`
+or your phone.
 
 ## Commit identity and push credentials
 
@@ -402,6 +448,14 @@ the PR opens. In Claude Code, `/groom ENG-123` reads the ticket the same way.
 
 ## Planning
 
+**The integration branch follows the base branch.** `orchestra run`, `plan`, `approve` and `add`
+compare your local `base_branch` with the integration branch. If integration is behind (say you
+committed an addendum to `main` after it was cut), it is fast-forwarded and the run says so.
+Nothing is fetched from `origin`, and a branch checked out somewhere is only reported. If the two
+have diverged, the command stops and says how many commits are on each side. When `main` already
+has everything integration has (a squash-merged PR), it gives the reset command. Pass
+`--allow-diverged` to go ahead anyway. While a run is live, `approve` and `add` only report.
+
 `orchestra plan` drafts against the integration branch (in a read-only `_plan` worktree, or the
 graph worktree), not your checkout. A critic agent (`[planning].critic`) checks coverage, paths,
 ordering, card size, criteria and `test_first`, and its corrected plan replaces the draft when it
@@ -411,6 +465,8 @@ flagged. Ready cards that more work waits on are dispatched first.
 Cards are sized before they run: planner, critic and triage see the real `max_diff_lines` and give
 each card `estimated_lines`; anything above `[quality].split_above` (default 0.7) of the limit
 should be split, and the printed plan flags cards that weren't. Generated or example data counts.
+`/groom` gets the same sizing rules. `orchestra approve` and `add` warn about every card with no
+estimate; set `[planning] require_estimates = true` to refuse such plans instead.
 While a worker runs, a size check after each edit tells it when it nears and passes the limit, so
 it stops and reports blocked instead of writing it all. A diff over `oversize_triage_factor`
 (default 1.5) times the limit goes straight to triage to be split, without a trim round.
@@ -443,18 +499,25 @@ it stops and reports blocked instead of writing it all. A diff over `oversize_tr
   first; set `setup_cmd` (e.g. `npm ci`) so each worktree can run them. The worker's card lists
   every gate command so it runs them before reporting done. Mark cheap gates `fast = true`.
 - **Lockfiles don't count** toward `max_diff_lines` (`[quality].diff_exclude`).
+- **Data files do count.** A JSON, CSV or seed file copied into the repo counts line by line
+  (T17 in the PCME run copied ~1,500 lines of JSON and failed the gate). Put folders of truly
+  generated data in `[quality].diff_exclude`. Otherwise keep committed examples hand-trimmed, or
+  commit a compact form (one record per line) with a test that it round-trips to the source.
+  Workers, test writers and triage are told the same.
 - **`gates_on_stop` (opt-in).** A Stop hook runs the `fast` gates when the worker reports done
   and sends it back once with the failures. Enable it after the smoke test below shows it works
   with your SDK version.
 - **Concurrency 2–4.** Rate limits are pooled across all sessions on your account.
 - **`[agents]` cost settings.** `cache_ttl = "5m"` (default) has agent sessions write the prompt
   cache for 5 minutes (1.25× input price) instead of an hour (2×). `bash_output_max_chars = 8000`
-  returns longer worker Bash output as its head and tail with a `[truncated N chars]` note
-  (0 = off).
+  returns longer Bash output (workers, test writers, reviewers, validators) as its head and tail
+  with a `[truncated N chars]` note (0 = off).
 - **Where the money went.** `orchestra usage <export-dir>` breaks an export of agent transcripts
-  (`agent-transcripts/<card>/*.jsonl` plus `tasks.json`/`events.json`/`sessions.json` or
-  `state.db`) down by card, role, model and session: tokens, estimated USD, cold starts, resume
-  rounds and large tool outputs.
+  (`agent-transcripts/<card>/*.jsonl` plus `tasks.json`/`events.json`/`sessions.json`,
+  `tasks-full.json`/`events.log`/`sessions.json`, or `state.db`) down by card, role, model and
+  session: tokens, estimated USD, cold starts, resume rounds (including `decision` answers) and
+  large tool outputs. Tool output the Bash cap already cut, and output in your own interactive
+  sessions, isn't counted as over the cap. Cards cancelled before any agent ran fold into one line.
 - **Models:** Opus plans and reviews; Sonnet does `small` tasks, Opus does `large` ones.
 - **Cost:** expect roughly 2–5× a single agent. The live smoke test (1 small task:
   worker + gates + review + merge) cost about $0.18 with Haiku/Sonnet.

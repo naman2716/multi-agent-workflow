@@ -29,3 +29,7 @@ A literal scope path whose folder doesn't exist SHALL produce a plan warning.
 
 ### Requirement: Risky cards are flagged test-first
 The planner SHALL set `test_first` on cards that change money, stored data, or auth/permissions.
+
+### Requirement: Oversized estimates are flagged
+Building tasks from a plan SHALL keep each card's `estimated_lines` and flag every card estimated
+above the split threshold, at plan, approve and add time and for triage splits.
