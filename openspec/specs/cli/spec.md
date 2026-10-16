@@ -39,3 +39,8 @@ preferred over prompt-shape guesses.
 ### Requirement: Card status lists sessions
 `orchestra status <card>` SHALL list the card's agent sessions with role, model, runs, cost and
 end reason.
+
+### Requirement: [git] section
+`orchestra.toml` SHALL accept a `[git]` section (`author`, `co_author`, `run_hooks`); invalid
+`author` or `co_author` values SHALL be config errors. `orchestra init` SHALL write the section
+with comments.

@@ -14,3 +14,6 @@
 - [x] 2.5 README: commit identity vs push credentials, hooks, re-authoring an unpushed branch
 - [x] 2.6 Spec deltas (git-integration, orchestration, cli)
 - [x] 2.7 Tests (design.md list); full suite
+
+## Phase 3: close
+- [x] 3.1 PR #6 merged (`db0f598`); deltas merged into `openspec/specs/`; archived 2026-10-16

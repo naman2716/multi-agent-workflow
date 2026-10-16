@@ -125,3 +125,9 @@ decide, the card SHALL be blocked rather than retried.
 A review's blocking findings (up to `max_validations`) SHALL be verified together in one
 validator session that returns a verdict per finding. A finding without a refuting verdict,
 or any finding when the validator fails, SHALL stand.
+
+### Requirement: A hook rejection is a failed gate
+When the repository's commit hooks reject a worker's commit, the worker SHALL get the hook output
+as gate feedback (`[gate:git hooks]`) in the same session, within the existing fix rounds, and the
+worktree SHALL keep what the hooks changed. When they reject the test writer's commit, the attempt
+SHALL fail with the hook output as feedback.
