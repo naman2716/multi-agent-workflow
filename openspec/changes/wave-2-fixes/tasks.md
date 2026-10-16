@@ -79,10 +79,17 @@ Full suite after every commit: 209 tests, only the 2 known macOS failures.
   `_sync_integration` call) and `README.md` ("Long goals" vs "The integration branch follows the
   base branch"). Keep both sides in each.
 
-## Phase 3: housekeeping (fix 11)
-- [ ] 3.1 `orchestra usage` on a `/tmp` copy of the export → `spend-less-per-card/after.md`;
-      compare with `baseline.md` (cost per merged card, cancelled-card spend, cold-start writes,
-      peak context, first-round review pass rate)
-- [ ] 3.2 Merge spend-less-per-card's deltas into `openspec/specs/`, then archive it
-- [ ] 3.3 Merge commit-identity's deltas, then archive it (PR #6 merged)
+## Phase 3: housekeeping (fix 11, done 2026-10-16)
+- [x] 3.1 `0fb6b57` `orchestra usage` on a `/tmp` copy of the export (checked identical with
+      `diff -rq`) → `spend-less-per-card/after.md`, compared with `baseline.md`:
+      - cost per merged card $2.11 → $1.74;
+      - cancelled/blocked spend $6.08 (26%) → $4.22 (24%);
+      - cold-start writes 16k per session in both; 1-hour writes 1.66M → 0; mid-session
+        re-writes 141k (≈ $0.55);
+      - agent peak context 145k → 133k;
+      - first-round review pass rate 82% → 90%.
+- [x] 3.2 `0fb6b57` spend-less-per-card deltas merged into `openspec/specs/`, archived as
+      `archive/2026-10-16-spend-less-per-card`. Its task 2.9b (README "Keeping your own session
+      cheap") is still open, awaiting a decision.
+- [x] 3.3 commit-identity deltas merged, archived as `archive/2026-10-16-commit-identity`
 - [ ] 3.4 After Phase 2 ships: merge these deltas, then archive wave-2-fixes
